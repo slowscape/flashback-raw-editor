@@ -1,5 +1,45 @@
 # Changelog
 
+## Unreleased — 2026-10-21
+
+Two film-grain emulsion models, non-destructive crop and straighten, auto
+exposure that accounts for the LUT, and a fix for DNG exports that were writing
+a thumbnail instead of the raw frame.
+
+### Added
+- **Film Grain v3** — rebuilds the picture out of silver clumps instead of
+  blending a noise layer. Six stocks, six formats, runs on the GPU.
+- **Film Grain v4** — the same emulsion with no clump library: every clump grows
+  its own crystals, so no two are alike.
+- **Crop and straighten**, per image and non-destructive. Aspect locked to the
+  original; straighten rotates the frame under a fixed crop box.
+- **Auto exposure** — meters each frame *through the active LUT* and protects the
+  highlights, so a LUT built at a different level needs no manual correction.
+- **LUT Level Match** (F12) — the per-vibe pre-LUT exposure offset is now
+  reachable. Set it to 0 for LUTs graded on an un-lifted export.
+- **Export for print** — writes a 16-bit LZW TIFF beside the JPEG.
+- **Vibe Save As** — custom vibes join the five factory looks in the picker and
+  persist across launches.
+- **Open Folder(s)** — pick several folders; each is scanned recursively for raws.
+- **Delete selected files** — removes selected raws from disk, with a confirmation.
+
+### Changed
+- Exports land in the dated folder beside `_RAW`, or next to the raw when there
+  is no dated folder. Nothing is overwritten: one free index is reserved across
+  every file an export writes.
+- Exposure adjusts in 0.01 EV steps.
+- The DNG export button is now labelled **Clean DNG**.
+
+### Fixed
+- **DNG export wrote the preview, not the raw.** The exporter took its strip
+  offsets from IFD0, which in these files holds a small preview, so exports were
+  ~650 KB of mislabelled thumbnail rather than the full 16 MB frame. It now finds
+  the CFA raw strip in the SubIFD.
+- A crop placed off-centre could shrink instead of sliding back inside the frame
+  after a straighten change.
+- Silenced the `ColourUsageWarning` about matplotlib on launch; the plotting
+  backend is not used.
+
 ## 1.6.5 — 2026-06-18
 
 A reworked halation that behaves like real film: a defined, photographic glow

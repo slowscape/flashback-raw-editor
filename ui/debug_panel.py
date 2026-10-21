@@ -5,10 +5,11 @@ Toggle visibility with F12.
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QFormLayout, QDoubleSpinBox, QSpinBox, QCheckBox,
-    QGroupBox, QLineEdit,
+    QGroupBox, QLineEdit, QInputDialog, QComboBox,
 )
 from PySide6.QtCore import Qt
 
+from core import grain_v3
 from core.config import (
     VibeConfig, VIBE_FIELD_NAMES,
     HALATION_THRESHOLD_STOPS, HALATION_BLUR_RADIUS, HALATION_STRENGTH_PCT,
@@ -17,7 +18,7 @@ from core.config import (
     SOFTNESS_SIGMA, GRAIN_STRENGTH_PCT, SHARPEN_STRENGTH_PCT, SHARPEN_RADIUS,
     CNR_AMOUNT_PCT, CNR_DESPIKE_PCT, CNR_DESPIKE_BIAS_PCT,
     VIGNETTE_STRENGTH_PCT, VIGNETTE_COLOR_PCT, VIGNETTE_CURVE,
-    BLOOM_STRENGTH_PCT, BLOOM_THRESHOLD_STOPS,
+    BLOOM_STRENGTH_PCT, BLOOM_THRESHOLD_STOPS, BASE_EXPOSURE_OFFSET_V2,
 )
 
 
@@ -57,6 +58,15 @@ class DebugPanel(QWidget):
         self.btn_save_vibe.setStyleSheet(btn_style)
         self.btn_save_vibe.clicked.connect(self._on_save_vibe)
         header.addWidget(self.btn_save_vibe)
+
+        self.btn_save_vibe_as = QPushButton("Save As…")
+        self.btn_save_vibe_as.setToolTip(
+            "Save the current settings as a brand-new vibe under a name you\n"
+            "choose. It shows up in the vibe picker alongside the 5 defaults."
+        )
+        self.btn_save_vibe_as.setStyleSheet(btn_style)
+        self.btn_save_vibe_as.clicked.connect(self._on_save_vibe_as)
+        header.addWidget(self.btn_save_vibe_as)
 
         self.btn_reset_saved = QPushButton("Reset to Saved")
         self.btn_reset_saved.setToolTip(
@@ -183,6 +193,18 @@ class DebugPanel(QWidget):
         self.chk_lut.stateChanged.connect(self.update_preview)
         live_layout.addRow(self.chk_lut)
 
+        self.spin_base_ev = self._create_double_spin(-6.0, 6.0, BASE_EXPOSURE_OFFSET_V2,
+                                                     0.25, suffix=" EV")
+        self.spin_base_ev.setToolTip(
+            "Constant exposure lift applied BEFORE the LUT, to bridge the gap\n"
+            "between the level your LUT was graded at and the app's intermediate.\n\n"
+            "The bundled LUTs want +2. A LUT graded on an un-lifted export will\n"
+            "arrive ~2 stops hot — set this to 0 for it instead of pulling the\n"
+            "exposure slider back on every image. Saves with the vibe."
+        )
+        self.spin_base_ev.valueChanged.connect(self.update_preview)
+        live_layout.addRow("LUT Level Match:", self.spin_base_ev)
+
         live_layout.addRow(self._create_separator())
 
         # Chromatic Aberration
@@ -240,9 +262,67 @@ class DebugPanel(QWidget):
         self.chk_grain.stateChanged.connect(self.update_preview)
         live_layout.addRow(self.chk_grain)
 
+        # Which grain model. 'standard' blends a noise layer over the picture;
+        # 'v3' rebuilds the picture out of silver (core/grain_v3.py). The two
+        # sets of controls below are shown/hidden to match the choice.
+        self.combo_grain_model = self._create_combo(
+            [("Standard", "standard"),
+             ("Film Grain v3 (library)", "v3"),
+             ("Film Grain v4 (no lookup)", "v4")])
+        self.combo_grain_model.setToolTip(
+            "Standard blends a noise layer over the picture.\n"
+            "v3 and v4 rebuild it out of silver - same films, same sizes;\n"
+            "v3 stamps 128 pre-drawn clump shapes, v4 grows every clump\n"
+            "its own crystals, so no two are alike.")
+        self.combo_grain_model.currentIndexChanged.connect(self._on_grain_model_changed)
+        live_layout.addRow("Grain Model:", self.combo_grain_model)
+
         self.spin_grain = self._create_double_spin(0.0, 200.0, GRAIN_STRENGTH_PCT, 5.0, suffix=" %")
         self.spin_grain.valueChanged.connect(self.update_preview)
-        live_layout.addRow("Grain Strength:", self.spin_grain)
+        self.row_grain_std = ("Grain Strength:", self.spin_grain)
+        live_layout.addRow(*self.row_grain_std)
+
+        # ---- Film Grain v3: the five controls the model exposes ----
+        self.combo_v3_stock = self._create_combo(
+            [(n, n) for n in grain_v3.stock_names()])
+        self.combo_v3_stock.currentIndexChanged.connect(self._on_v3_stock_changed)
+        self.row_v3_stock = ("Film:", self.combo_v3_stock)
+        live_layout.addRow(*self.row_v3_stock)
+
+        self.lbl_v3_note = QLabel("")
+        self.lbl_v3_note.setWordWrap(True)
+        self.lbl_v3_note.setStyleSheet("color: #888; font-size: 11px;")
+        self.row_v3_note = ("", self.lbl_v3_note)
+        live_layout.addRow(*self.row_v3_note)
+
+        self.combo_v3_format = self._create_combo(
+            [(n, n) for n in grain_v3.format_names()])
+        self.combo_v3_format.setToolTip(
+            "Bigger film is enlarged less, so the grain lands finer AND\n"
+            "smoother. This is the only grain-size control there is.")
+        self.combo_v3_format.currentIndexChanged.connect(self.update_preview)
+        self.row_v3_format = ("Shot on:", self.combo_v3_format)
+        live_layout.addRow(*self.row_v3_format)
+
+        self.spin_v3_strength = self._create_double_spin(0.0, 150.0, 100.0, 5.0, suffix=" %")
+        self.spin_v3_strength.setToolTip("100% is the emulsion as it comes.")
+        self.spin_v3_strength.valueChanged.connect(self.update_preview)
+        self.row_v3_strength = ("Film Strength:", self.spin_v3_strength)
+        live_layout.addRow(*self.row_v3_strength)
+
+        self.spin_v3_variation = self._create_spin(1, 40, 1)
+        self.spin_v3_variation.setToolTip("Another roll of the same film.")
+        self.spin_v3_variation.valueChanged.connect(self.update_preview)
+        self.row_v3_variation = ("Variation:", self.spin_v3_variation)
+        live_layout.addRow(*self.row_v3_variation)
+
+        self.chk_v3_mono = QCheckBox("Shoot it in black and white")
+        self.chk_v3_mono.setToolTip(
+            "Any picture, not just one already grey — the colour is read for\n"
+            "brightness and set aside, and what comes back is the silver.")
+        self.chk_v3_mono.stateChanged.connect(self.update_preview)
+        self.row_v3_mono = ("", self.chk_v3_mono)
+        live_layout.addRow(*self.row_v3_mono)
 
         live_layout.addRow(self._create_separator())
 
@@ -417,6 +497,7 @@ class DebugPanel(QWidget):
             'enable_chromatic_aberration': self.chk_ca,
             'enable_softness': self.chk_softness,
             'enable_grain': self.chk_grain,
+            'grain_v3_mono': self.chk_v3_mono,
             'enable_sharpen': self.chk_sharpen,
             'enable_cnr': self.chk_cnr,
             'enable_lut': self.chk_lut,
@@ -433,7 +514,10 @@ class DebugPanel(QWidget):
             'ca_blue_blur': self.spin_ca_blue_blur,
             'ca_zoom_blur_pct': self.spin_ca_zoom_blur,
             'softness_sigma': self.spin_softness,
+            'base_exposure_offset_v2': self.spin_base_ev,
             'grain_strength_pct': self.spin_grain,
+            'grain_v3_strength_pct': self.spin_v3_strength,
+            'grain_v3_variation': self.spin_v3_variation,
             'sharpen_strength_pct': self.spin_sharpen_str,
             'sharpen_radius': self.spin_sharpen_rad,
             'cnr_amount_pct': self.spin_cnr,
@@ -445,6 +529,21 @@ class DebugPanel(QWidget):
             'bloom_strength_pct': self.spin_bloom_str,
             'bloom_threshold_stops': self.spin_bloom_thresh,
         }
+        # String-valued fields: dropdowns keep their value in item data, so they
+        # need their own table (the bool/numeric ones use setChecked/setValue).
+        self._combo_widgets = {
+            'grain_model': (self.combo_grain_model, 'standard'),
+            'grain_v3_stock': (self.combo_v3_stock, grain_v3.DEFAULT_STOCK),
+            'grain_v3_format': (self.combo_v3_format, grain_v3.DEFAULT_FORMAT),
+        }
+        # Seed each dropdown from the schema default. A combo otherwise starts
+        # at index 0 (Acros 100 / 35mm), and the first update_config would write
+        # that back over the vibe's real default.
+        _defaults = VibeConfig()
+        for _name, (_w, _fallback) in self._combo_widgets.items():
+            self._set_combo_value(_w, getattr(_defaults, _name, _fallback))
+        self._refresh_v3_note()
+        self._update_grain_rows()
 
     # ===================================================================
     # HELPERS
@@ -468,11 +567,75 @@ class DebugPanel(QWidget):
         spin.setStyleSheet("QSpinBox { background-color: #3d3d3d; color: #d0d0d0; border: 1px solid #555; border-radius: 4px; padding: 4px; }")
         return spin
 
+    def _create_combo(self, items):
+        """Styled dropdown. ``items`` is [(label, value), ...]; the value is
+        stored as item data so the config keeps stable strings even if a label
+        is reworded."""
+        box = QComboBox()
+        for label, value in items:
+            box.addItem(label, value)
+        box.setStyleSheet(
+            "QComboBox { background-color: #3d3d3d; color: #d0d0d0; border: 1px solid #555;"
+            " border-radius: 4px; padding: 4px; }"
+            "QComboBox::drop-down { border: none; width: 18px; }"
+            "QComboBox QAbstractItemView { background-color: #3d3d3d; color: #d0d0d0;"
+            " selection-background-color: #FF8A35; selection-color: #1a1a1a;"
+            " border: 1px solid #555; }"
+        )
+        return box
+
     def _create_separator(self):
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet("color: #444;")
         return line
+
+    # ---- Film Grain v3 ----------------------------------------------------
+
+    def _combo_value(self, box, fallback):
+        v = box.currentData()
+        return fallback if v is None else v
+
+    def _set_combo_value(self, box, value):
+        i = box.findData(value)
+        if i >= 0:
+            box.setCurrentIndex(i)
+
+    def _grain_rows(self):
+        """(standard-only rows, v3-only rows) as (label, widget) pairs."""
+        return ([self.row_grain_std],
+                [self.row_v3_stock, self.row_v3_note, self.row_v3_format,
+                 self.row_v3_strength, self.row_v3_variation, self.row_v3_mono])
+
+    def _update_grain_rows(self):
+        """Show only the controls belonging to the selected grain model."""
+        # v3 and v4 share the five emulsion controls; only 'standard' differs.
+        is_v3 = self._combo_value(self.combo_grain_model, 'standard') in ('v3', 'v4')
+        std_rows, v3_rows = self._grain_rows()
+        layout = self.spin_grain.parentWidget().layout()
+        for label, w in std_rows:
+            w.setVisible(not is_v3)
+            lw = layout.labelForField(w) if layout else None
+            if lw is not None:
+                lw.setVisible(not is_v3)
+        for label, w in v3_rows:
+            w.setVisible(is_v3)
+            lw = layout.labelForField(w) if layout else None
+            if lw is not None:
+                lw.setVisible(is_v3)
+
+    def _on_grain_model_changed(self):
+        self._update_grain_rows()
+        self.update_preview()
+
+    def _on_v3_stock_changed(self):
+        self._refresh_v3_note()
+        self.update_preview()
+
+    def _refresh_v3_note(self):
+        spec = grain_v3.STOCKS.get(
+            self._combo_value(self.combo_v3_stock, grain_v3.DEFAULT_STOCK))
+        self.lbl_v3_note.setText(spec["note"] if spec else "")
 
     # ===================================================================
     # ACTIONS
@@ -487,6 +650,8 @@ class DebugPanel(QWidget):
             setattr(vibe, name, bool(w.isChecked()))
         for name, w in self._numeric_widgets.items():
             setattr(vibe, name, w.value())
+        for name, (w, fallback) in self._combo_widgets.items():
+            setattr(vibe, name, self._combo_value(w, fallback))
 
         self.status_label.setText("Config updated. Click 'Reload Image' to apply baked effects.")
 
@@ -495,7 +660,9 @@ class DebugPanel(QWidget):
         if not self.parent_editor:
             return
         vibe = self.parent_editor.current_vibe
-        all_widgets = list(self._bool_widgets.values()) + list(self._numeric_widgets.values())
+        all_widgets = (list(self._bool_widgets.values())
+                       + list(self._numeric_widgets.values())
+                       + [w for w, _ in self._combo_widgets.values()])
         for w in all_widgets:
             w.blockSignals(True)
         try:
@@ -503,9 +670,13 @@ class DebugPanel(QWidget):
                 w.setChecked(bool(getattr(vibe, name)))
             for name, w in self._numeric_widgets.items():
                 w.setValue(getattr(vibe, name))
+            for name, (w, fallback) in self._combo_widgets.items():
+                self._set_combo_value(w, getattr(vibe, name, fallback))
         finally:
             for w in all_widgets:
                 w.blockSignals(False)
+        self._refresh_v3_note()
+        self._update_grain_rows()
         self.refresh_lut_label()
 
     def refresh_lut_label(self):
@@ -603,6 +774,15 @@ class DebugPanel(QWidget):
     def _on_save_vibe(self):
         if self.parent_editor:
             self.parent_editor.save_current_vibe_defaults()
+
+    def _on_save_vibe_as(self):
+        if not self.parent_editor:
+            return
+        name, ok = QInputDialog.getText(self, "Save Vibe As", "Name for the new vibe:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        self.parent_editor.save_current_vibe_as(name)
 
     def _on_reset_saved(self):
         if self.parent_editor:

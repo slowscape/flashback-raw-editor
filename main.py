@@ -1,6 +1,12 @@
 """
 LoFi Logic — entry point.
 """
+import warnings
+# colour-science emits a ColourUsageWarning at import/use when matplotlib (its
+# optional plotting backend) isn't installed. We never use colour.plotting, so
+# silence that one message before anything imports colour.
+warnings.filterwarnings("ignore", message=r'.*[Mm]atplotlib.*')
+
 import logging
 import os
 import shutil

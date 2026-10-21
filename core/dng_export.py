@@ -5,6 +5,7 @@ Flashback's calibrated colour metadata (dual-illuminant ForwardMatrix /
 ColorMatrix, AsShotNeutral, embedded tone-curve profile) plus an RGB preview
 thumbnail. The TIFF/DNG IFD structure is hand-built here — no external DNG SDK.
 """
+import io
 import logging
 import struct
 import numpy as np
@@ -58,18 +59,71 @@ def _pack_ifd(tags: list, current_offset: int, next_ifd_offset: int = 0) -> byte
     entries += struct.pack('<I', next_ifd_offset)
     return entries + extra
 
+def _find_raw_strip(data: bytes):
+    """Locate the CFA raw strip (offset, length) in a little-endian DNG.
+
+    The full-resolution sensor data lives in a SubIFD (referenced by tag 330),
+    while IFD0 holds a reduced-resolution preview. Walking IFD0's StripOffsets/
+    StripByteCounts — as exifread's `Image Strip*` tags do — yields only the
+    tiny preview, so we descend into the SubIFDs and pick the strip whose IFD is
+    tagged CFA (PhotometricInterpretation 32803) or LinearRaw (34892), falling
+    back to the largest strip found. Returns None if the file can't be parsed.
+    """
+    if data[:2] != b'II':
+        return None
+    try:
+        u16 = lambda o: struct.unpack_from('<H', data, o)[0]
+        u32 = lambda o: struct.unpack_from('<I', data, o)[0]
+        _TSIZE = {1: 1, 2: 1, 3: 2, 4: 4, 5: 8, 6: 1, 7: 1, 8: 2, 9: 4, 10: 4, 11: 4, 12: 8}
+        candidates = []  # (photometric, byte_count, offset)
+
+        def walk(off):
+            n = u16(off)
+            strip_off = strip_len = photometric = None
+            subifds = []
+            for i in range(n):
+                e = off + 2 + i * 12
+                tag, typ, cnt = u16(e), u16(e + 2), u32(e + 4)
+                valoff = e + 8 if cnt * _TSIZE.get(typ, 1) <= 4 else u32(e + 8)
+                if tag == 273:      # StripOffsets (first strip)
+                    strip_off = u32(valoff)
+                elif tag == 279:    # StripByteCounts (sum across strips)
+                    strip_len = sum(u32(valoff + j * 4) for j in range(cnt))
+                elif tag == 262:    # PhotometricInterpretation
+                    photometric = u16(valoff)
+                elif tag == 330:    # SubIFDs
+                    subifds.extend(u32(valoff + j * 4) for j in range(cnt))
+            if strip_off is not None and strip_len is not None:
+                candidates.append((photometric, strip_len, strip_off))
+            for s in subifds:
+                walk(s)
+
+        walk(u32(4))
+        if not candidates:
+            return None
+        raw = [c for c in candidates if c[0] in (32803, 34892)]
+        photometric, strip_len, strip_off = max(raw or candidates, key=lambda c: c[1])
+        return strip_off, strip_len
+    except Exception:
+        return None
+
 def export_dng(source_path: str, output_path: str, thumbnail_rgb: np.ndarray, profile_name: str = 'Flashback Standard') -> bool:
     try:
-        # Pass the source DNG's 10-bit raw strip through verbatim.
         with open(source_path, 'rb') as f:
-            tags = exifread.process_file(f, details=False)
+            src = f.read()
+        tags = exifread.process_file(io.BytesIO(src), details=False)
 
-        raw_off = int(tags['Image StripOffsets'].values[0]) if 'Image StripOffsets' in tags else 2048
-        raw_len = int(tags['Image StripByteCounts'].values[0]) if 'Image StripByteCounts' in tags else SENSOR_RAW_STRIP_BYTES
-
-        with open(source_path, 'rb') as f:
-            f.seek(raw_off)
-            raw_bytes = f.read(raw_len)
+        # Pass the source DNG's 10-bit raw strip through verbatim. The raw CFA
+        # data is in a SubIFD, not IFD0 (which holds only a small preview), so
+        # locate it explicitly rather than trusting exifread's IFD0 Strip tags.
+        strip = _find_raw_strip(src)
+        if strip is None:
+            raw_off, raw_len = 2048, SENSOR_RAW_STRIP_BYTES
+        else:
+            raw_off, raw_len = strip
+        raw_bytes = src[raw_off:raw_off + raw_len]
+        if len(raw_bytes) != raw_len:
+            log.warning("Raw strip truncated: expected %d bytes, got %d", raw_len, len(raw_bytes))
 
         # Carry the source's ExposureTime forward so reverse-AE still works if a
         # clean DNG is re-imported. The camera writes it in IFD0; we re-emit it

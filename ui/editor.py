@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QLabel, QSlider, QPushButton, QFileDialog, QMessageBox, QProgressBar,
     QScrollArea, QFrame, QSizePolicy, QCheckBox,
+    QListView, QTreeView, QAbstractItemView,
 )
 from PySide6.QtCore import (
     Qt, QTimer, QSize, Signal, QPoint, QThread, QEvent,
@@ -197,6 +198,17 @@ class _ByteBudgetLRU(OrderedDict):
             del self[key]
 
 
+# Slider ticks per EV on the exposure slider. 100 gives two decimal places;
+# the slider is integer-only, so this is the single place that resolution is
+# defined and every tick<->EV conversion goes through it.
+EV_TICKS = 100
+
+
+# Per-image geometry (crop + straighten). Excluded from the copy/paste settings
+# clipboard — these are per-photo framing decisions, not a look to broadcast.
+GEOMETRY_KEYS = ('straighten_deg', 'crop_scale', 'crop_cx', 'crop_cy')
+
+
 class FlashbackEditor(QMainWindow):
     """Main application window for LoFi Logic image editing."""
 
@@ -320,14 +332,17 @@ class FlashbackEditor(QMainWindow):
         self._active_lut_ref = None
 
         self._tint_manual_offset = 0.0  # user's manual tint correction on top of WB coupling
+        # Auto exposure: the metered value, and the user's nudge on top of it.
+        self._auto_exposure_ev = 0.0
+        self._exposure_manual_offset = 0.0
 
         self.pending_render = False
 
-        # Run pre-1.5 → 1.5.0 vibe-state migration once. The report (if
-        # any) is stashed for the post-window-shown notice; vibes loaded
-        # here are not directly used (the editor reads via _vibe_for) but
-        # calling migrate_and_load is what triggers the on-disk rewrite.
-        _, self._migration_report = vibe_state.migrate_and_load()
+        # Run pre-1.5 → 1.5.0 vibe-state migration once. The report (if any)
+        # is stashed for the post-window-shown notice. The loaded vibes dict
+        # is kept only to find custom (non-factory) saved ids — the editor
+        # otherwise reads current settings via _vibe_for, not this snapshot.
+        saved_vibes, self._migration_report = vibe_state.migrate_and_load()
 
         # LUT is loaded by FlashbackProcessor from current_vibe.lut_ref
         # (factory:<id> or user:<path>). No path argument anymore — the
@@ -343,6 +358,17 @@ class FlashbackEditor(QMainWindow):
         self._render_needs_commit = False  # True after slider release
 
         self.init_ui()
+
+        # Repopulate the picker with any custom vibes saved in a previous
+        # session (anything saved under an id that isn't one of the 5
+        # factory presets — see save_current_vibe_as). Sorted by name so the
+        # list order is stable across launches.
+        custom = sorted(
+            ((vid, v) for vid, v in saved_vibes.items() if vid not in VIBE_PRESETS),
+            key=lambda pair: (pair[1].display_name or pair[0]).lower(),
+        )
+        for vid, v in custom:
+            self.vibe_picker.add_custom_vibe(vid, v.display_name or vid)
 
         self.debug_panel = DebugPanel(self.processor, self)
         self._on_vibe_selected(self.vibe_picker._current)
@@ -530,6 +556,11 @@ class FlashbackEditor(QMainWindow):
                     if self.image_files:
                         self.rotate_counterclockwise()
                     return True
+                elif key == Qt.Key_C and event.modifiers() == Qt.NoModifier:
+                    # Plain 'C' toggles crop mode (Ctrl+C stays copy-settings).
+                    if self.image_files:
+                        self.btn_crop.toggle()
+                    return True
 
         if event.type() == QEvent.Type.MouseButtonDblClick:
             if source == self.slider_exposure:
@@ -541,13 +572,16 @@ class FlashbackEditor(QMainWindow):
             elif source == self.slider_tint:
                 self.reset_tint_slider()
                 return True
+            elif source == self.slider_straighten:
+                self.reset_straighten_slider()
+                return True
         return super().eventFilter(source, event)
 
     def reset_exposure_slider(self):
         self.slider_exposure.blockSignals(True)
         self.slider_exposure.setValue(0)
         self.slider_exposure.blockSignals(False)
-        self.label_exposure.setText("0.0 EV")
+        self.label_exposure.setText("0.00 EV")
         self.processor.adjustments.exposure_ev = 0.0
         self.save_current_settings()
         self._render_needs_commit = True
@@ -577,6 +611,16 @@ class FlashbackEditor(QMainWindow):
         self.slider_tint.blockSignals(False)
         self.label_tint.setText("+0")
         self.processor.adjustments.tint = 0.0
+        self.save_current_settings()
+        self._render_needs_commit = True
+        self._render_worker.request(downscale=False)
+
+    def reset_straighten_slider(self):
+        self.slider_straighten.blockSignals(True)
+        self.slider_straighten.setValue(0)
+        self.slider_straighten.blockSignals(False)
+        self.label_straighten.setText("0.0°")
+        self.processor.adjustments.straighten_deg = 0.0
         self.save_current_settings()
         self._render_needs_commit = True
         self._render_worker.request(downscale=False)
@@ -789,6 +833,9 @@ class FlashbackEditor(QMainWindow):
 
         self.loader_overlay = LoaderOverlay(self.centralWidget())
         self.settings_clipboard = None
+        self.crop_mode = False
+        # The crop box overlay reports changes here; persist them per-image.
+        self.image_label.on_crop_changed = self._on_crop_changed
 
         # ⌘R resets all sliders
         reset_sc = QAction(self)
@@ -945,6 +992,8 @@ class FlashbackEditor(QMainWindow):
         v.addWidget(self._build_tone_section())
         v.addWidget(self._divider())
         v.addWidget(self._build_color_section())
+        v.addWidget(self._divider())
+        v.addWidget(self._build_geometry_section())
         v.addStretch(1)
         v.addWidget(self._divider())
         v.addWidget(self._build_export_footer())
@@ -969,8 +1018,36 @@ class FlashbackEditor(QMainWindow):
             hl.addWidget(aside)
         return w
 
-    def _slider_row(self, label_text: str, value_label: QLabel, slider: ScrubSlider) -> QWidget:
-        """Label row + slider as a single column."""
+    def _auto_pill(self, tooltip: str) -> QPushButton:
+        """The small checkable AUTO pill used beside a slider label."""
+        pill = QPushButton("AUTO")
+        pill.setCheckable(True)
+        pill.setCursor(Qt.PointingHandCursor)
+        pill.setFont(theme.ui_font(9, QFont.DemiBold))
+        pill.setFixedHeight(18)
+        self._themed(pill, lambda: (
+            f"QPushButton {{"
+            f"  background: {C['bg_input']};"
+            f"  border: 1px solid {C['border_input']};"
+            f"  border-radius: 9px;"
+            f"  color: {C['text_dim']};"
+            f"  letter-spacing: 0.8px;"
+            f"  padding: 0 8px;"
+            f"}}"
+            f"QPushButton:hover {{ color: {C['text_primary']}; }}"
+            f"QPushButton:checked {{"
+            f"  background: {C['accent']};"
+            f"  border-color: {C['accent']};"
+            f"  color: #1a1410;"
+            f"}}"
+        ))
+        pill.setToolTip(tooltip)
+        return pill
+
+    def _slider_row(self, label_text: str, value_label: QLabel, slider: ScrubSlider,
+                    aside: QWidget = None) -> QWidget:
+        """Label row + slider as a single column. ``aside`` puts a small control
+        (e.g. an AUTO pill) beside the label, before the stretch."""
         box = QWidget()
         bl = QVBoxLayout(box)
         bl.setContentsMargins(0, 0, 0, 0)
@@ -986,6 +1063,8 @@ class FlashbackEditor(QMainWindow):
             lambda: f"color: {C['text_label']}; letter-spacing: 0.4px;",
         )
         header.addWidget(l)
+        if aside is not None:
+            header.addWidget(aside)
         header.addStretch(1)
         value_label.setFont(theme.mono_font(12, QFont.Medium))
         self._themed(
@@ -1019,11 +1098,16 @@ class FlashbackEditor(QMainWindow):
         self._apply_vibe(vibe_id, vibe, refresh_thumbnails=True)
 
     def _vibe_for(self, vibe_id: str) -> VibeConfig:
-        """Saved VibeConfig if present for `vibe_id`, otherwise the factory recipe."""
+        """Saved VibeConfig if present for `vibe_id`, otherwise the factory
+        recipe. Falls back to bare defaults for a custom id with no saved
+        entry (e.g. its state file was edited/removed out from under a live
+        session) rather than raising on the VIBE_PRESETS lookup."""
         saved = vibe_state.load_all().get(vibe_id)
         if saved is not None:
             return saved
-        return vibe_config_for(vibe_id)
+        if vibe_id in VIBE_PRESETS:
+            return vibe_config_for(vibe_id)
+        return VibeConfig(display_name=vibe_id)
 
     def _apply_vibe(self, vibe_id: str, vibe: VibeConfig, refresh_thumbnails: bool = False):
         """Install `vibe` as the active vibe: bind it to the processor, load
@@ -1039,6 +1123,10 @@ class FlashbackEditor(QMainWindow):
         # Tag the per-image record with the new vibe id (for future Save Project).
         self.processor.adjustments.active_vibe_id = vibe_id
         self._apply_effective_lut()
+        # A different LUT means a different correct exposure, so re-meter —
+        # keeping whatever nudge the user had dialled in on top.
+        if hasattr(self, 'chk_auto_exposure'):
+            self._apply_auto_exposure(keep_offset=True)
         if hasattr(self, 'debug_panel'):
             self.debug_panel.sync_from_config()
             self.debug_panel.update_modified_indicator()
@@ -1151,6 +1239,34 @@ class FlashbackEditor(QMainWindow):
             self.debug_panel.update_modified_indicator()
             self.debug_panel.status_label.setText(f"Saved defaults for {vibe_id}.")
 
+    def _unique_vibe_id(self, name: str) -> str:
+        """A fresh, file-safe, collision-free vibe id for a "Save As" name.
+        `custom_` prefixes every generated id, both for readability in the
+        saved-state JSON and so a user-typed name can never collide with a
+        current or future factory preset id."""
+        slug = re.sub(r'[^a-z0-9]+', '_', name.strip().lower()).strip('_') or 'vibe'
+        existing = set(VIBE_PRESETS.keys()) | set(vibe_state.load_all().keys())
+        candidate = f"custom_{slug}"
+        if candidate not in existing:
+            return candidate
+        n = 2
+        while f"{candidate}_{n}" in existing:
+            n += 1
+        return f"{candidate}_{n}"
+
+    def save_current_vibe_as(self, name: str):
+        """Save the live VibeConfig as a brand-new custom vibe, register it in
+        the picker, and switch to it. `name` is whatever the user typed in
+        the F12 "Save As" prompt (already validated non-empty by the caller)."""
+        vibe_id = self._unique_vibe_id(name)
+        new_vibe = self.current_vibe.copy()
+        new_vibe.display_name = name
+        vibe_state.save_one(vibe_id, new_vibe)
+        self.vibe_picker.add_custom_vibe(vibe_id, name)
+        self.vibe_picker.set_vibe(vibe_id)  # emits vibe_changed -> _on_vibe_selected
+        if hasattr(self, 'debug_panel'):
+            self.debug_panel.status_label.setText(f"Saved as new vibe '{name}'.")
+
     def reset_current_vibe_to_saved(self):
         """Discard session edits, reload saved defaults (or factory if no saved)."""
         vibe_id = self.current_vibe_id()
@@ -1223,17 +1339,29 @@ class FlashbackEditor(QMainWindow):
         reset_w.setLayout(reset_row)
         v.addWidget(reset_w)
 
-        # Exposure
-        self.label_exposure = QLabel("0.0 EV")
+        # Exposure — with an AUTO pill that meters the frame *through the LUT*
+        # (see processor.auto_exposure_ev), so a LUT authored at a different
+        # input level doesn't have to be dialled back by hand on every image.
+        self.label_exposure = QLabel("0.00 EV")
         self.label_exposure.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+
+        auto_ev_pill = self._auto_pill(
+            "Auto exposure: meters this image through the active LUT and sets\n"
+            "the starting exposure. Your slider nudges ride on top of it.")
+        auto_ev_pill.toggled.connect(self._on_auto_exposure_toggled)
+        self.chk_auto_exposure = auto_ev_pill
+
+        # Ticks are hundredths of a stop: +/-3 EV at 0.01 resolution. Every
+        # tick<->EV conversion below divides by EV_TICKS, so they cannot drift.
         self.slider_exposure = ScrubSlider(dual=True)
-        self.slider_exposure.setMinimum(-30)
-        self.slider_exposure.setMaximum(30)
+        self.slider_exposure.setMinimum(-3 * EV_TICKS)
+        self.slider_exposure.setMaximum(3 * EV_TICKS)
         self.slider_exposure.setValue(0)
         self.slider_exposure.valueChanged.connect(self.on_exposure_slider_moved)
         self.slider_exposure.sliderReleased.connect(self.on_exposure_released)
         self.slider_exposure.installEventFilter(self)
-        v.addWidget(self._slider_row("EXPOSURE", self.label_exposure, self.slider_exposure))
+        v.addWidget(self._slider_row("EXPOSURE", self.label_exposure,
+                                     self.slider_exposure, aside=auto_ev_pill))
         return sec
 
     def _build_color_section(self) -> QWidget:
@@ -1258,31 +1386,9 @@ class FlashbackEditor(QMainWindow):
         self.label_tint = QLabel("+0")
         self.label_tint.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
 
-        auto_pill = QPushButton("AUTO")
-        auto_pill.setCheckable(True)
-        auto_pill.setCursor(Qt.PointingHandCursor)
-        auto_pill.setFont(theme.ui_font(9, QFont.DemiBold))
-        auto_pill.setFixedHeight(18)
-        self._themed(auto_pill, lambda: (
-            f"QPushButton {{"
-            f"  background: {C['bg_input']};"
-            f"  border: 1px solid {C['border_input']};"
-            f"  border-radius: 9px;"
-            f"  color: {C['text_dim']};"
-            f"  letter-spacing: 0.8px;"
-            f"  padding: 0 8px;"
-            f"}}"
-            f"QPushButton:hover {{ color: {C['text_primary']}; }}"
-            f"QPushButton:checked {{"
-            f"  background: {C['accent']};"
-            f"  border-color: {C['accent']};"
-            f"  color: #1a1410;"
-            f"}}"
-        ))
-        auto_pill.setToolTip(
+        auto_pill = self._auto_pill(
             "Auto tint: WB moves tint proportionally.\n"
-            "Manual tint nudges are preserved on top."
-        )
+            "Manual tint nudges are preserved on top.")
         auto_pill.toggled.connect(self._on_wb_link_toggled)
         self.chk_wb_link = auto_pill
 
@@ -1317,6 +1423,54 @@ class FlashbackEditor(QMainWindow):
         v.addWidget(tint_box)
         return sec
 
+    def _build_geometry_section(self) -> QWidget:
+        sec = QWidget()
+        v = QVBoxLayout(sec)
+        v.setContentsMargins(14, 14, 14, 14)
+        v.setSpacing(10)
+
+        # Crop toggle lives inline in the section header (the rail is a fixed
+        # 300px with no spare vertical room for another button row).
+        crop_pill = QPushButton("CROP")
+        crop_pill.setCheckable(True)
+        crop_pill.setCursor(Qt.PointingHandCursor)
+        crop_pill.setFont(theme.ui_font(9, QFont.DemiBold))
+        crop_pill.setFixedHeight(18)
+        self._themed(crop_pill, lambda: (
+            f"QPushButton {{"
+            f"  background: {C['bg_input']};"
+            f"  border: 1px solid {C['border_input']};"
+            f"  border-radius: 9px;"
+            f"  color: {C['text_dim']};"
+            f"  letter-spacing: 0.8px;"
+            f"  padding: 0 8px;"
+            f"}}"
+            f"QPushButton:hover {{ color: {C['text_primary']}; }}"
+            f"QPushButton:checked {{"
+            f"  background: {C['accent']};"
+            f"  border-color: {C['accent']};"
+            f"  color: #1a1410;"
+            f"}}"
+        ))
+        crop_pill.setToolTip("Crop mode (C): drag the box to crop.\nStraighten stays live while cropping.")
+        crop_pill.toggled.connect(self._toggle_crop_mode)
+        self.btn_crop = crop_pill
+        v.addWidget(self._section_header("CROP & STRAIGHTEN", aside=crop_pill))
+
+        # Straighten: ±15° in 0.1° steps. Slider value = degrees × 10, so the
+        # dual (bipolar) track centres at level. Double-click resets to 0.
+        self.label_straighten = QLabel("0.0°")
+        self.label_straighten.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self.slider_straighten = ScrubSlider(dual=True)
+        self.slider_straighten.setMinimum(-150)
+        self.slider_straighten.setMaximum(150)
+        self.slider_straighten.setValue(0)
+        self.slider_straighten.valueChanged.connect(self.on_straighten_slider_moved)
+        self.slider_straighten.sliderReleased.connect(self.on_straighten_released)
+        self.slider_straighten.installEventFilter(self)
+        v.addWidget(self._slider_row("ANGLE", self.label_straighten, self.slider_straighten))
+        return sec
+
     def _build_export_footer(self) -> QWidget:
         sec = QWidget()
         sec.setObjectName("ExportFooter")
@@ -1335,7 +1489,7 @@ class FlashbackEditor(QMainWindow):
         pills_row = QHBoxLayout()
         pills_row.setSpacing(6)
         self.btn_export_jpeg = QPushButton("JPEG")
-        self.btn_export_dng  = QPushButton("DNG")
+        self.btn_export_dng  = QPushButton("Clean DNG")
         for b in (self.btn_export_jpeg, self.btn_export_dng):
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
@@ -1403,15 +1557,46 @@ class FlashbackEditor(QMainWindow):
         ))
         v.addWidget(self.progress_bar)
 
+        # Process button + the print toggle beside it. Print mode adds a 16-bit
+        # TIFF alongside the JPEG; off, a JPEG is all that is written.
+        proc_row = QHBoxLayout()
+        proc_row.setContentsMargins(0, 0, 0, 0)
+        proc_row.setSpacing(8)
+
         self.btn_process_all = QPushButton("Process 0 / 0")
         self.btn_process_all.setEnabled(False)
         self.btn_process_all.setFixedHeight(40)
         self.btn_process_all.setCursor(Qt.PointingHandCursor)
         self._themed(self.btn_process_all, lambda: process_btn_qss())
         self.btn_process_all.clicked.connect(self.process_all_images)
-        v.addWidget(self.btn_process_all)
+        proc_row.addWidget(self.btn_process_all, 1)
 
-        # Initialize pill state to default (JPEG)
+        self.chk_export_print = QCheckBox("Export for print")
+        self.chk_export_print.setCursor(Qt.PointingHandCursor)
+        self.chk_export_print.setToolTip(
+            "Also write a 16-bit LZW TIFF next to the JPEG — the print master.\n"
+            "Off: JPEG only.")
+        self._themed(self.chk_export_print, lambda: (
+            f"QCheckBox {{ color: {C['text_secondary']}; font-size: 11px; }}"
+            f"QCheckBox::indicator {{ width: 13px; height: 13px; border-radius: 3px;"
+            f"  border: 1px solid {C['border_input']}; background: {C['bg_input']}; }}"
+            f"QCheckBox::indicator:checked {{ background: {C['accent']};"
+            f"  border-color: {C['accent']}; }}"
+        ))
+        self.chk_export_print.toggled.connect(self._on_export_print_toggled)
+        proc_row.addWidget(self.chk_export_print, 0)
+
+        proc_w = QWidget()
+        proc_w.setLayout(proc_row)
+        v.addWidget(proc_w)
+
+        # Restore the print-master choice, then initialise the pills (JPEG).
+        _print_saved = self.app_settings.value("export_print_master", False)
+        if isinstance(_print_saved, str):        # QSettings can hand back "true"
+            _print_saved = _print_saved.lower() == 'true'
+        self.chk_export_print.blockSignals(True)
+        self.chk_export_print.setChecked(bool(_print_saved))
+        self.chk_export_print.blockSignals(False)
         self.set_export_mode('jpeg')
         return sec
 
@@ -1482,6 +1667,13 @@ class FlashbackEditor(QMainWindow):
         act_open.triggered.connect(self.open_files)
         file_menu.addAction(act_open)
 
+        act_open_folders = QAction("Open Folder(s)…", self)
+        act_open_folders.setShortcut(QKeySequence("Ctrl+Shift+F"))
+        act_open_folders.setToolTip(
+            "Select one or more folders — each is scanned recursively for raw files.")
+        act_open_folders.triggered.connect(self.open_folders)
+        file_menu.addAction(act_open_folders)
+
         file_menu.addSeparator()
 
         act_open_project = QAction("Open Project…", self)
@@ -1510,7 +1702,7 @@ class FlashbackEditor(QMainWindow):
         act_export_jpg.triggered.connect(self.export_as_jpeg)
         file_menu.addAction(act_export_jpg)
 
-        act_export_dng = QAction("Export DNGs", self)
+        act_export_dng = QAction("Export Clean DNGs", self)
         act_export_dng.triggered.connect(self.export_as_dng)
         file_menu.addAction(act_export_dng)
 
@@ -1566,6 +1758,14 @@ class FlashbackEditor(QMainWindow):
         act_remove.setShortcut(QKeySequence(Qt.Key_Delete))
         act_remove.triggered.connect(self.remove_current_from_project)
         edit_menu.addAction(act_remove)
+
+        act_delete_files = QAction("Delete Selected Files…", self)
+        act_delete_files.setShortcut(QKeySequence("Shift+Del"))
+        act_delete_files.setToolTip(
+            "Permanently delete the selected raw files from disk.\n"
+            "Right-click thumbnails to select.")
+        act_delete_files.triggered.connect(self.delete_selected_files)
+        edit_menu.addAction(act_delete_files)
 
         # ── View ──────────────────────────────────────────────────────
         view_menu = mb.addMenu("View")
@@ -1985,6 +2185,46 @@ class FlashbackEditor(QMainWindow):
             self.app_settings.setValue("last_open_dir", new_dir)
             self.load_image_files(self._resolve_input_paths(files))
 
+    @staticmethod
+    def _get_existing_directories(parent, caption, start_dir):
+        """Multi-folder picker. Qt has no built-in "select several directories"
+        dialog (getExistingDirectory is single-select only), so this uses the
+        standard workaround: a non-native QFileDialog in Directory mode with its
+        internal list/tree views switched to extended selection, letting the
+        user ctrl/shift-click several folders before confirming."""
+        dlg = QFileDialog(parent, caption, start_dir)
+        dlg.setFileMode(QFileDialog.FileMode.Directory)
+        dlg.setOption(QFileDialog.Option.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.Option.ShowDirsOnly, True)
+        for view_cls in (QListView, QTreeView):
+            view = dlg.findChild(view_cls)
+            if view is not None:
+                view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        if dlg.exec() != QFileDialog.DialogCode.Accepted:
+            return []
+        return dlg.selectedFiles()
+
+    def open_folders(self):
+        """Open one or more folders: each is scanned recursively for supported
+        raws (see _images_from_folder) and the results replace the session,
+        same as File > Open with individual files."""
+        default_dir = QStandardPaths.writableLocation(QStandardPaths.PicturesLocation) or str(Path.home())
+        start_dir = self.app_settings.value("last_open_dir", default_dir)
+
+        folders = self._get_existing_directories(self, "Select Folder(s)", start_dir)
+        if not folders:
+            return
+
+        self.app_settings.setValue("last_open_dir", folders[0])
+        image_files = self._resolve_input_paths(folders)
+        if not image_files:
+            QMessageBox.information(
+                self, "No Images Found",
+                "No supported raw files were found in the selected folder(s)."
+            )
+            return
+        self.load_image_files(image_files)
+
     def _stop_vibe_refresh_worker(self):
         """Stop, join, and release the vibe-refresh worker.
 
@@ -2348,6 +2588,96 @@ class FlashbackEditor(QMainWindow):
         self.update_process_button_text()
         self.load_current_image()
 
+    @staticmethod
+    def _files_backing(file_path):
+        """Every file on disk that *is* this image.
+
+        Normally just the raw itself. A V1 negative is a pair — the headerless
+        payload plus its .json sidecar — and deleting only one of them leaves an
+        unopenable orphan, so both go.
+        """
+        paths = [Path(file_path)]
+        try:
+            if is_v1_negative(str(file_path)):
+                from core.v1_negative import _stem_paths
+                raw_path, json_path = _stem_paths(str(file_path))
+                paths = [p for p in (raw_path, json_path) if p is not None]
+        except Exception:
+            log.debug("sidecar lookup failed for %s", file_path, exc_info=True)
+        return paths
+
+    def delete_selected_files(self):
+        """Permanently delete the selected raws from disk, then drop them from
+        the session. Selection is the right-click (process) selection; with
+        nothing selected it acts on the image on screen.
+
+        This is destructive and not undoable — hence the explicit confirm,
+        which defaults to Cancel and names the folder.
+        """
+        if not self.image_files:
+            return
+
+        selected = sorted(self.thumbnail_strip.get_process_selected_indices())
+        if not selected:
+            selected = [self.current_index]
+        selected = [i for i in selected if 0 <= i < len(self.image_files)]
+        if not selected:
+            return
+
+        targets = [str(self.image_files[i]) for i in selected]
+        n = len(targets)
+        folders = {str(Path(p).parent) for p in targets}
+        where = next(iter(folders)) if len(folders) == 1 else f"{len(folders)} folders"
+        names = "\n".join(f"  • {Path(p).name}" for p in targets[:8])
+        if n > 8:
+            names += f"\n  … and {n - 8} more"
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Delete files from disk")
+        box.setText(f"Permanently delete {n} file{'s' if n != 1 else ''} from disk?")
+        box.setInformativeText(
+            f"{names}\n\nFrom: {where}\n\n"
+            "This deletes the original raw file(s), not just the edit. "
+            "It cannot be undone and does not use the Recycle Bin.\n\n"
+            "Exports already written are left alone."
+        )
+        box.setStandardButtons(QMessageBox.Cancel | QMessageBox.Yes)
+        box.setDefaultButton(QMessageBox.Cancel)   # destructive: never default to Yes
+        box.button(QMessageBox.Yes).setText(f"Delete {n} file{'s' if n != 1 else ''}")
+        if box.exec() != QMessageBox.Yes:
+            return
+
+        deleted, failures = [], []
+        for idx, file_path in zip(selected, targets):
+            try:
+                for p in self._files_backing(file_path):
+                    if p.exists():
+                        os.remove(p)
+                deleted.append(idx)
+            except OSError as e:
+                log.error("Delete failed for %s: %s", file_path, e)
+                failures.append((Path(file_path).name, str(e)))
+
+        # Drop from the session highest-index-first so the earlier indices (and
+        # the strip's renumbering) stay valid as we go.
+        for idx in sorted(deleted, reverse=True):
+            self.remove_from_project(idx)
+
+        self.thumbnail_strip.clear_process_selection()
+        self.update_process_button_text()
+
+        if failures:
+            detail = "\n".join(f"{name}: {err}" for name, err in failures[:10])
+            QMessageBox.warning(
+                self, "Some files could not be deleted",
+                f"Deleted {len(deleted)} of {n}.\n\n{detail}")
+        else:
+            self.mode_label.setText(
+                f"Deleted {len(deleted)} file{'s' if len(deleted) != 1 else ''}")
+            self.mode_label.setStyleSheet(f"color: {C['accent']};")
+            QTimer.singleShot(2500, self.update_mode_label)
+
     def on_thumbnail_right_click(self, index):
         if 0 <= index < len(self.image_files):
             self.thumbnail_strip.toggle_process_selection(index)
@@ -2412,6 +2742,11 @@ class FlashbackEditor(QMainWindow):
             round(a.exposure_ev, 4), round(a.wb_temp, 4), round(a.tint, 4),
             round(getattr(a, 'push_pull_ev', 0.0), 4),
             getattr(a, 'rotation', 0),
+            round(getattr(a, 'straighten_deg', 0.0), 4),
+            round(getattr(a, 'crop_scale', 1.0), 5),
+            round(getattr(a, 'crop_cx', 0.5), 5),
+            round(getattr(a, 'crop_cy', 0.5), 5),
+            getattr(self.processor, '_apply_crop', True),
             self.current_vibe_id(),
             id(self.processor.lut),
         )
@@ -2421,6 +2756,9 @@ class FlashbackEditor(QMainWindow):
             self.label_filename.setText("")
             self.label_counter.setText("0 / 0")
             return
+
+        # Switching images leaves crop mode (its edits are already persisted).
+        self._exit_crop_mode_if_active()
 
         # Cancel any in-flight scrub render and clear the commit flag — the
         # processor state is about to change out from under the worker.
@@ -2438,12 +2776,18 @@ class FlashbackEditor(QMainWindow):
         # vibe has a V1 variant (e.g. disposable) — before any render below.
         self._apply_effective_lut(file_path)
 
-        if file_path in self.image_settings:
+        # A revisited image restores its own saved exposure; a fresh one gets
+        # metered below, once its intermediate is in hand.
+        first_visit = file_path not in self.image_settings
+        if not first_visit:
             settings = self.image_settings[file_path]
             self.processor.set_settings(settings)
             self.chk_wb_link.blockSignals(True)
             self.chk_wb_link.setChecked(settings.get('auto_tint', False))
             self.chk_wb_link.blockSignals(False)
+            self.chk_auto_exposure.blockSignals(True)
+            self.chk_auto_exposure.setChecked(settings.get('auto_exposure', False))
+            self.chk_auto_exposure.blockSignals(False)
             self.update_sliders_from_processor()
         else:
             self.processor.adjustments = ImageAdjustments(active_vibe_id=self.current_vibe_id())
@@ -2459,6 +2803,10 @@ class FlashbackEditor(QMainWindow):
             # Restore Flashback status so DNG button reflects the correct state
             self.processor.is_flashback_file = self._file_is_flashback.get(file_path, False)
             self._update_dng_button_state()
+            if first_visit:
+                self._exposure_manual_offset = 0.0
+                if self._apply_auto_exposure(keep_offset=False):
+                    self.save_current_settings()
             # Revisiting an image must be instant and must not block the UI
             # thread on a GPU readback (that readback serialises behind any
             # in-flight full-res render on the shared device — the freeze that
@@ -2497,6 +2845,10 @@ class FlashbackEditor(QMainWindow):
                     self.processor.adjustments.rotation = stored_rot
                     img_array = self.processor._apply_rotation_and_render()
                 self.image_cache[file_path] = self.processor.intermediate_acescg.copy()
+                if first_visit:
+                    self._exposure_manual_offset = 0.0
+                    if self._apply_auto_exposure(keep_offset=False):
+                        img_array = self.processor.render_preview(downscale=True)
                 self.preview_cache[file_path] = (self._preview_key(), img_array)
                 self.update_current_thumbnail(img_array)
                 self.display_image(img_array, is_scrub=True)
@@ -2548,19 +2900,24 @@ class FlashbackEditor(QMainWindow):
         self.slider_exposure.blockSignals(True)
         self.slider_wb.blockSignals(True)
         self.slider_tint.blockSignals(True)
+        self.slider_straighten.blockSignals(True)
 
-        self.slider_exposure.setValue(int(a.exposure_ev * 10))
+        self.slider_exposure.setValue(int(round(a.exposure_ev * EV_TICKS)))
         self.slider_wb.setValue(int(a.wb_temp))
         self.slider_tint.setValue(int(round(a.tint * 5)))
+        straighten = getattr(a, 'straighten_deg', 0.0)
+        self.slider_straighten.setValue(int(round(straighten * 10)))
 
-        self.label_exposure.setText(f"{a.exposure_ev:.1f} EV")
+        self.label_exposure.setText(f"{a.exposure_ev:.2f} EV")
         temp_absolute = 5600 + int(a.wb_temp)
         self.label_wb.setText(f"{temp_absolute} K")
         self.label_tint.setText(f"{int(round(a.tint * 5)):+d}")
+        self.label_straighten.setText(f"{straighten:.1f}°")
 
         self.slider_exposure.blockSignals(False)
         self.slider_wb.blockSignals(False)
         self.slider_tint.blockSignals(False)
+        self.slider_straighten.blockSignals(False)
 
         # Keep the manual tint offset coherent with the newly loaded settings
         if self.chk_wb_link.isChecked():
@@ -2593,8 +2950,13 @@ class FlashbackEditor(QMainWindow):
     # ===================================================================
 
     def on_exposure_slider_moved(self, value):
-        ev = value / 10.0
-        self.label_exposure.setText(f"{ev:.1f} EV")
+        ev = value / EV_TICKS
+        self.label_exposure.setText(f"{ev:.2f} EV")
+        # With AUTO on, the slider reads absolute EV but what the user is really
+        # setting is a nudge on top of the metered value — remember it so a
+        # LUT/vibe change re-meters without throwing their adjustment away.
+        if self.chk_auto_exposure.isChecked():
+            self._exposure_manual_offset = ev - self._auto_exposure_ev
         self.processor.adjustments.exposure_ev = ev
         self._render_worker.request(downscale=True)
 
@@ -2605,6 +2967,58 @@ class FlashbackEditor(QMainWindow):
 
     def _on_wb_link_toggled(self, checked):
         self.save_current_settings()
+
+    # ---- auto exposure ------------------------------------------------------
+
+    def _apply_auto_exposure(self, keep_offset=True):
+        """Meter the loaded image through the active LUT and move the exposure
+        slider to the result.
+
+        ``keep_offset`` carries the user's manual nudge across a recompute (a
+        vibe/LUT change), the way the tint link preserves manual tint. Toggling
+        AUTO on clears the nudge instead, so it lands on the metered value.
+        No-op when AUTO is off or nothing is loaded.
+        """
+        if not self.chk_auto_exposure.isChecked() or not self.image_files:
+            return False
+        auto_ev = self.processor.auto_exposure_ev()
+        if auto_ev is None:
+            return False
+        self._auto_exposure_ev = auto_ev
+        offset = self._exposure_manual_offset if keep_offset else 0.0
+        if not keep_offset:
+            self._exposure_manual_offset = 0.0
+        # Quantise to the slider's own step (0.1 EV) and clamp to its range, so
+        # slider, label and processor all carry the same number — otherwise the
+        # render uses -2.13 while the slider reads -2.1, and the next drag jumps.
+        lo, hi = self.slider_exposure.minimum(), self.slider_exposure.maximum()
+        ticks = max(lo, min(hi, int(round((auto_ev + offset) * EV_TICKS))))
+        ev = ticks / EV_TICKS
+        self.processor.adjustments.exposure_ev = ev
+        self.slider_exposure.blockSignals(True)
+        self.slider_exposure.setValue(ticks)
+        self.slider_exposure.blockSignals(False)
+        self.label_exposure.setText(f"{ev:.2f} EV")
+        return True
+
+    def _on_auto_exposure_toggled(self, checked):
+        if checked:
+            # Fresh reading, ignoring whatever nudge was on the slider.
+            if not self._apply_auto_exposure(keep_offset=False):
+                self.save_current_settings()
+                return
+            self.save_current_settings()
+            self._render_needs_commit = True
+            self._render_worker.request(downscale=False)
+            img = self.processor.render_preview(downscale=True)
+            self.display_image(img, is_scrub=True)
+            self.update_current_thumbnail(img)
+            self.mode_label.setText(f"Auto exposure  {self._auto_exposure_ev:+.2f} EV")
+            self.mode_label.setStyleSheet(f"color: {C['accent']};")
+            QTimer.singleShot(2000, self.update_mode_label)
+        else:
+            self._exposure_manual_offset = 0.0
+            self.save_current_settings()
 
     def _coupled_tint(self, wb_offset):
         """Coupled tint value for a given WB offset from neutral (5600K).
@@ -2653,9 +3067,87 @@ class FlashbackEditor(QMainWindow):
         self._render_needs_commit = True
         self._render_worker.request(downscale=False)
 
+    def on_straighten_slider_moved(self, value):
+        deg = value / 10.0
+        self.label_straighten.setText(f"{deg:.1f}°")
+        self.processor.adjustments.straighten_deg = deg
+        if self.crop_mode:
+            # In crop mode the image is rendered full-frame (uncropped) so the
+            # box can be placed over the whole rotated frame; render it here and
+            # re-clamp the overlay to the new bounds rather than via the worker.
+            img = self.processor.render_preview(downscale=True)
+            self.display_image(img, is_scrub=True)
+            self.image_label.set_crop_angle(deg)
+        else:
+            self._render_worker.request(downscale=True)
+
+    def on_straighten_released(self):
+        self.save_current_settings()
+        if self.crop_mode:
+            img = self.processor.render_preview()
+            self.display_image(img)
+            self.image_label.set_crop_angle(self.processor.adjustments.straighten_deg)
+        else:
+            self._render_needs_commit = True
+            self._render_worker.request(downscale=False)
+
+    # ===================================================================
+    # CROP MODE
+    # ===================================================================
+
+    def _toggle_crop_mode(self, checked):
+        # Guard: nothing to crop without a loaded image — revert the pill.
+        if checked and not self.image_files:
+            self.btn_crop.blockSignals(True)
+            self.btn_crop.setChecked(False)
+            self.btn_crop.blockSignals(False)
+            return
+        self.crop_mode = checked
+        a = self.processor.adjustments
+        if checked:
+            # Show the full straightened frame (no crop) so the box can be
+            # dragged over the whole image; the overlay draws the crop region.
+            if hasattr(self, '_render_worker'):
+                self._render_worker.invalidate()
+            self.processor._apply_crop = False
+            img = self.processor.render_preview()
+            self.display_image(img)
+            self.image_label.enter_crop_mode(
+                getattr(a, 'crop_scale', 1.0), getattr(a, 'crop_cx', 0.5),
+                getattr(a, 'crop_cy', 0.5), getattr(a, 'straighten_deg', 0.0))
+        else:
+            self.processor._apply_crop = True
+            self.image_label.exit_crop_mode()
+            img = self.processor.render_preview()
+            self.display_image(img)
+            self.update_current_thumbnail(img)
+            self.save_current_settings()
+            if hasattr(self, '_render_worker'):
+                self._render_needs_commit = True
+                self._render_worker.request(downscale=False)
+
+    def _on_crop_changed(self, scale, cx, cy):
+        """Crop box moved/resized (fired on drag release). The displayed image
+        doesn't change in crop mode, so just store + persist — no re-render."""
+        a = self.processor.adjustments
+        a.crop_scale, a.crop_cx, a.crop_cy = scale, cx, cy
+        self.save_current_settings()
+
+    def _exit_crop_mode_if_active(self):
+        """Leave crop mode without committing a render (used before an image
+        switch). Crop edits are already persisted on each drag release."""
+        if not self.crop_mode:
+            return
+        self.crop_mode = False
+        self.processor._apply_crop = True
+        self.image_label.exit_crop_mode()
+        self.btn_crop.blockSignals(True)
+        self.btn_crop.setChecked(False)
+        self.btn_crop.blockSignals(False)
+
     def adjust_exposure(self, delta):
         current = self.slider_exposure.value()
-        self.slider_exposure.setValue(current + int(delta * 10))
+        self.slider_exposure.setValue(current + int(round(delta * EV_TICKS)))
         self.on_exposure_released()
 
     def adjust_wb(self, delta):
@@ -2672,17 +3164,21 @@ class FlashbackEditor(QMainWindow):
         self.slider_exposure.blockSignals(True)
         self.slider_wb.blockSignals(True)
         self.slider_tint.blockSignals(True)
+        self.slider_straighten.blockSignals(True)
 
-        self.label_exposure.setText("0.0 EV")
+        self.label_exposure.setText("0.00 EV")
         self.label_wb.setText("5600 K")
         self.label_tint.setText("+0")
+        self.label_straighten.setText("0.0°")
         self.slider_exposure.setValue(0)
         self.slider_wb.setValue(0)
         self.slider_tint.setValue(0)
+        self.slider_straighten.setValue(0)
 
         self.slider_exposure.blockSignals(False)
         self.slider_wb.blockSignals(False)
         self.slider_tint.blockSignals(False)
+        self.slider_straighten.blockSignals(False)
 
         self._tint_manual_offset = 0.0
         self.processor.adjustments = ImageAdjustments(active_vibe_id=self.current_vibe_id())
@@ -2706,14 +3202,49 @@ class FlashbackEditor(QMainWindow):
         self.mode_label.setStyleSheet(f"color: {C['text_dim']};")
         self.status_dot.setStyleSheet(f"color: {C['processed']};")
 
+    def _export_dir_for(self, file_path) -> str:
+        """Where a source's exports go.
+
+        Camera imports land in ``<date>/_RAW/``, so their exports go up one level
+        into the dated folder (alongside the day's other edits). A raw opened
+        from anywhere else (no ``_RAW`` parent) exports next to itself.
+        """
+        p = Path(file_path)
+        if p.parent.name == '_RAW':
+            return str(p.parent.parent)
+        return str(p.parent)
+
+    @staticmethod
+    def _free_export_stem(stem: str, exts) -> str:
+        """A path stem on which *none* of ``exts`` already exists.
+
+        Returns ``stem`` itself when it is clear, else the first free
+        ``<stem>_<n>``. One index is reserved across the whole set so a photo's
+        outputs stay grouped — a re-export writes ``foo_1.jpg`` *and*
+        ``foo_1.tiff``, never ``foo_1.jpg`` beside ``foo_3.tiff``. Nothing is
+        ever overwritten.
+        """
+        def taken(s):
+            return any(os.path.exists(s + e) for e in exts)
+
+        if not taken(stem):
+            return stem
+        n = 1
+        while taken(f"{stem}_{n}"):
+            n += 1
+        return f"{stem}_{n}"
+
     def _is_processed(self, file_path: str) -> bool:
-        """True if an export file exists in output_dir for this source image."""
+        """True if an export already exists for this source (in its export dir)."""
         try:
+            export_dir = self._export_dir_for(file_path)
             base = export_basename(file_path)
-            candidates = ["_clean.dng", "_edit.jpg"]
-            candidates += [f"_{s}.jpg" for s in VIBE_EXPORT_SUFFIX.values()]
+            stems = ["_clean.dng"]
+            for s in ('edit',) + tuple(VIBE_EXPORT_SUFFIX.values()):
+                stems += [f"_{s}.jpg", f"_{s}.tiff"]
+            candidates = stems
             for suffix in candidates:
-                if os.path.exists(os.path.join(self.output_dir, base + suffix)):
+                if os.path.exists(os.path.join(export_dir, base + suffix)):
                     return True
         except Exception:
             log.debug("export-exists check failed for %s", file_path, exc_info=True)
@@ -2724,7 +3255,18 @@ class FlashbackEditor(QMainWindow):
             file_path = str(self.image_files[self.current_index])
             settings = self.processor.get_settings()
             settings['auto_tint'] = self.chk_wb_link.isChecked()
+            settings['auto_exposure'] = self.chk_auto_exposure.isChecked()
             self.image_settings[file_path] = settings
+
+    def _paste_merged(self, file_path):
+        """Clipboard look combined with this file's own crop/straighten, which
+        paste must never overwrite (see GEOMETRY_KEYS / copy_settings)."""
+        existing = self.image_settings.get(file_path, {})
+        merged = self.settings_clipboard.copy()
+        for k in GEOMETRY_KEYS:
+            if k in existing:
+                merged[k] = existing[k]
+        return merged
 
     # ===================================================================
     # COPY / PASTE SETTINGS
@@ -2743,6 +3285,9 @@ class FlashbackEditor(QMainWindow):
     def copy_settings(self):
         self.settings_clipboard = self.processor.get_settings()
         self.settings_clipboard['auto_tint'] = self.chk_wb_link.isChecked()
+        # Crop + straighten are per-photo framing, not part of the copied look.
+        for k in GEOMETRY_KEYS:
+            self.settings_clipboard.pop(k, None)
         self.mode_label.setText("Settings copied")
         self.mode_label.setStyleSheet(f"color: {C['accent']};")
         QTimer.singleShot(2000, self.update_mode_label)
@@ -2754,6 +3299,10 @@ class FlashbackEditor(QMainWindow):
         if hasattr(self, '_render_worker'):
             self._render_worker.invalidate()
         self._render_needs_commit = False
+
+        # Snapshot the current image's live state (incl. its crop) so the
+        # geometry-preserving merge below sees fresh values.
+        self.save_current_settings()
 
         paste_selected = self.thumbnail_strip.get_paste_selected_indices()
 
@@ -2768,26 +3317,28 @@ class FlashbackEditor(QMainWindow):
 
             for idx in indices_to_apply:
                 file_path = str(self.image_files[idx])
-                self.image_settings[file_path] = self.settings_clipboard.copy()
+                self.image_settings[file_path] = self._paste_merged(file_path)
                 success_count += 1
                 if success_count % 5 == 0:
                     self.mode_label.setText(f"Applied {success_count}/{total}...")
                     QApplication.processEvents()
 
             if self.current_index in paste_selected:
-                self.processor.set_settings(self.settings_clipboard)
+                cur_settings = self.image_settings[str(self.image_files[self.current_index])]
+                self.processor.set_settings(cur_settings)
                 img_array = self.processor.render_preview()
                 self.chk_wb_link.blockSignals(True)
-                self.chk_wb_link.setChecked(self.settings_clipboard.get('auto_tint', False))
+                self.chk_wb_link.setChecked(cur_settings.get('auto_tint', False))
                 self.chk_wb_link.blockSignals(False)
                 self.update_sliders_from_processor()
                 self.display_image(img_array)
-                self.update_thumbnail_for_settings(self.current_index, self.settings_clipboard)
+                self.update_thumbnail_for_settings(self.current_index, cur_settings)
 
             self.mode_label.setText(f"Updating thumbnails...")
             for idx in indices_to_apply:
                 if idx != self.current_index:
-                    self.update_thumbnail_for_settings(idx, self.settings_clipboard)
+                    self.update_thumbnail_for_settings(
+                        idx, self.image_settings[str(self.image_files[idx])])
 
             self.thumbnail_strip.clear_paste_selection()
             self.mode_label.setText(f"Settings applied to {success_count} images")
@@ -2852,8 +3403,15 @@ class FlashbackEditor(QMainWindow):
         self.btn_export_dng.setChecked(mode == 'dng')
         self.btn_export_jpeg.setStyleSheet(format_pill_qss(mode == 'jpeg'))
         self.btn_export_dng.setStyleSheet(format_pill_qss(mode == 'dng'))
+        # The print master is a companion to the JPEG; a Clean DNG export is a
+        # raw passthrough with nothing to render, so the toggle doesn't apply.
+        if hasattr(self, 'chk_export_print'):
+            self.chk_export_print.setEnabled(mode != 'dng')
         if hasattr(self, "btn_process_all") and hasattr(self, "thumbnail_strip"):
             self.update_process_button_text()
+
+    def _on_export_print_toggled(self, checked):
+        self.app_settings.setValue("export_print_master", bool(checked))
 
     def process_all_images(self):
         if not self.image_files:
@@ -2922,14 +3480,23 @@ class FlashbackEditor(QMainWindow):
                         self.processor.set_settings(self.image_settings[file_path])
 
                 base_name = export_basename(file_path)
+                export_dir = self._export_dir_for(file_path)
+                os.makedirs(export_dir, exist_ok=True)
+                print_mode = self.chk_export_print.isChecked()
                 if self.export_mode == 'dng':
-                    output_path = os.path.join(self.output_dir, f"{base_name}_clean.dng")
+                    stem = os.path.join(export_dir, f"{base_name}_clean")
+                    exts = ['.dng']
                 else:
                     # Per-file LUT (V1 negatives get the V1-tuned variant).
                     self._apply_effective_lut(file_path)
                     vibe_id = self.processor.adjustments.active_vibe_id
                     suffix = VIBE_EXPORT_SUFFIX.get(vibe_id, 'edit')
-                    output_path = os.path.join(self.output_dir, f"{base_name}_{suffix}.jpg")
+                    stem = os.path.join(export_dir, f"{base_name}_{suffix}")
+                    exts = ['.jpg'] + (['.tiff'] if print_mode else [])
+                # Never overwrite an existing export — reserve one free index
+                # across every file this export will write.
+                stem = self._free_export_stem(stem, exts)
+                output_path = stem + exts[0]
 
                 if self.export_mode == 'dng':
                     from core.dng_export import export_dng
@@ -2955,7 +3522,7 @@ class FlashbackEditor(QMainWindow):
                         th = max(1, int(thumb.shape[0] * tw / thumb.shape[1]))
                         thumb = cv2.resize(thumb, (tw, th), interpolation=cv2.INTER_LINEAR)
                     ok = export_dng(file_path, output_path, thumb, self.current_vibe.dng_profile_name)
-                elif export_image(self.processor, output_path):
+                elif export_image(self.processor, output_path, print_master=print_mode):
                     ok = True
                 else:
                     ok = False
@@ -3137,23 +3704,25 @@ class FlashbackEditor(QMainWindow):
             return []
 
     def _images_from_folder(self, folder):
-        """Collect loadable images from an already-imported folder: supported
-        raws plus V1 negatives (extensionless raw + .json sidecar). Loaded in
-        place — no copy, so re-dragging a folder never overwrites it.
-        Non-recursive; sorted by name."""
+        """Collect loadable images from a folder AND all its subfolders:
+        supported raws plus V1 negatives (extensionless raw + .json sidecar).
+        Loaded in place — no copy, so dropping a folder never overwrites or
+        moves anything on disk. Sorted by full path."""
         found = []
-        try:
-            entries = sorted(Path(folder).iterdir(), key=lambda x: x.name.lower())
-        except OSError:
-            return found
-        for entry in entries:
-            if not entry.is_file() or entry.name.lower().endswith('.json'):
-                continue  # .json is a V1 sidecar, picked up with its raw
-            if entry.name.lower().endswith(self.SUPPORTED_EXTENSIONS) \
-                    or is_v1_negative(str(entry)):
-                found.append(entry)
+        for root, dirs, files in os.walk(folder):
+            # Skip hidden/dot directories so recursion doesn't wander into
+            # VCS or app-cache folders that might live inside a photo library.
+            dirs[:] = [d for d in dirs if not d.startswith('.')]
+            for name in files:
+                if name.lower().endswith('.json'):
+                    continue  # .json is a V1 sidecar, picked up with its raw
+                entry = Path(root) / name
+                if name.lower().endswith(self.SUPPORTED_EXTENSIONS) \
+                        or is_v1_negative(str(entry)):
+                    found.append(entry)
+        found.sort(key=lambda p: str(p).lower())
         if not found:
-            log.warning("[editor] no loadable images in folder: %s", folder)
+            log.warning("[editor] no loadable images in folder (incl. subfolders): %s", folder)
         return found
 
     def _resolve_input_paths(self, paths):

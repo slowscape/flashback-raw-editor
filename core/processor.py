@@ -48,15 +48,62 @@ from .config import (
     resolve_lut_ref,
     _timing_print,
 )
-from .kernels import (acescct_encode, apply_grain, encode_then_lut, run_resident,
-                      color_transform)
+from .kernels import (acescct_encode, apply_grain, apply_lut_cpu, encode_then_lut,
+                      run_resident, color_transform)
 from .gpu import gpu
 from .v1_negative import is_v1_negative, develop_v1
 from .auto_exposure_reverse import compute_reverse_gain
+from .grain_v3 import GrainV3Look, render_v3_cpu
+from .grain_v4 import GrainV4Look, render_v4_cpu
+
+
+# ---- auto exposure tuning ---------------------------------------------------
+# Exposure sits *before* a non-linear LUT, so the right value cannot be solved
+# in closed form — auto_exposure_ev bisects on a thumbnail-sized render instead.
+AE_PROBE_PX = 128          # long edge of the probe (decimated, not resampled)
+AE_TARGET_MEDIAN = 0.45    # where the midtone should land, display sRGB
+AE_HIGHLIGHT_PCT = 99.5    # the percentile treated as "the highlights"...
+AE_HIGHLIGHT_MAX = 0.98    # ...which must not be pushed past this
+AE_EV_MIN, AE_EV_MAX = -6.0, 6.0
+AE_ITERS = 13              # bisection steps: 12 EV range -> ~0.0015 EV, well
+                           # under the slider's own 0.01 EV resolution
+
+
+def _grain_model(vibe) -> str:
+    """Which grain engine this vibe asks for: 'standard', 'v3' or 'v4'.
+    Tolerates vibes saved before either emulsion model existed."""
+    m = getattr(vibe, 'grain_model', 'standard')
+    return m if m in ('standard', 'v3', 'v4') else 'standard'
+
+
+def _grain_is_v3(vibe) -> bool:
+    """True when the vibe asks for an emulsion model (v3 or v4) rather than the
+    standard blended noise layer."""
+    return _grain_model(vibe) in ('v3', 'v4')
+
+
+def grain_v3_look(vibe):
+    """The emulsion Look this vibe describes, for whichever engine is selected.
+
+    v3 and v4 expose the same five controls and read the same config fields —
+    the model picks the engine, not the film — so this just returns the
+    matching dataclass. Percent strength -> the model’s 0–1.5.
+    """
+    cls = GrainV4Look if _grain_model(vibe) == 'v4' else GrainV3Look
+    return cls(
+        stock=getattr(vibe, 'grain_v3_stock', 'Tri-X 400'),
+        fmt=getattr(vibe, 'grain_v3_format', '35mm'),
+        strength=float(getattr(vibe, 'grain_v3_strength_pct', 100.0)) / 100.0,
+        mono=bool(getattr(vibe, 'grain_v3_mono', False)),
+        variation=int(getattr(vibe, 'grain_v3_variation', 1)),
+    )
+
+
 from .effects import (
     apply_lut_fast,
     apply_chromatic_aberration,
     apply_halation,
+    crop_straighten,
     apply_softness,
     apply_edge_softness,
     apply_sharpen,
@@ -501,6 +548,9 @@ class FlashbackProcessor:
         self.highlight_mode = 1
         self.rawpy_bright = 1.0
         self.enable_highlight_recovery = True
+        # When False, _render straightens but does NOT crop — the crop-edit
+        # overlay shows the full rotated frame while the user drags the box.
+        self._apply_crop = True
 
         self.lut = None
         path, origin = resolve_lut_ref(self.vibe.lut_ref)
@@ -626,7 +676,15 @@ class FlashbackProcessor:
             sigma = v.softness_sigma
             stages.append(lambda fr, s=sigma: gpu.softness_frame(fr, s))
         grain_layer = None
-        if v.enable_grain and v.grain_strength_pct > 0:
+        if v.enable_grain and _grain_is_v3(v):
+            # The emulsion models rebuild the picture out of silver rather than
+            # blending a noise layer, so they replace the standard stage
+            # entirely — and carry their own strength (no grain_layer).
+            look = grain_v3_look(v)
+            draw = (gpu.grain_v4_frame if _grain_model(v) == 'v4'
+                    else gpu.grain_v3_frame)
+            stages.append(lambda fr, lk=look, fn=draw: fn(fr, lk))
+        elif v.enable_grain and v.grain_strength_pct > 0:
             h, w = shape[:2]
             g_strength = pct(v.grain_strength_pct)
             grain_layer = self._generate_grain_layer(h, w, sigma=g_strength)
@@ -853,6 +911,112 @@ class FlashbackProcessor:
             log.exception("[processor] load failed for %s: %s", dng_path, e)
             return None
 
+    # ---- auto exposure --------------------------------------------------------
+
+    def _pre_lut_ev(self):
+        """The counteracted EV terms — reverse-AE, post-AE boost, push/pull.
+
+        Mirrors the block in _render; kept as one method so the auto-exposure
+        probe can never drift from what the renderer actually does.
+        """
+        a, v = self.adjustments, self.vibe
+        f = float(v.reverse_ae_strength)
+        rev_gain = self._rev_gain if v.enable_reverse_autoexposure else 1.0
+        rev_ev = float(np.log2(rev_gain)) if rev_gain > 0 else 0.0
+        boost_ev = float(v.post_ae_exposure_boost_ev) if v.enable_post_ae_exposure_boost else 0.0
+        return f * rev_ev + f * boost_ev + float(a.push_pull_ev)
+
+    def _ae_probe_luma(self, small, exposure_ev):
+        """Display-referred luma this image would have at `exposure_ev`.
+
+        Runs the real tone path — the same gain, ACEScct encode, LUT (or the
+        tone-curve fallback) and post-gain the renderer uses — on a tiny copy.
+        Effects are skipped: vignette, grain and friends do not move exposure,
+        and leaving them out is what makes this cheap enough to bisect on.
+        """
+        v = self.vibe
+        pre_lut_ev = self._pre_lut_ev()
+        ev = float(2.0 ** (exposure_ev + v.base_exposure_offset_v2 + pre_lut_ev))
+        img = small * ev
+
+        if v.enable_lut and self.lut is not None:
+            # Encoded in numpy on purpose: kernels.acescct_encode dispatches to
+            # the GPU, and a round-trip per bisection step on a thumbnail costs
+            # far more than the arithmetic it saves.
+            x = np.maximum(img, 1e-10)
+            enc = np.where(x <= 0.0078125,
+                           10.5402377416545 * x + 0.0729055341958355,
+                           (np.log2(x) + 9.72) / 17.52).astype(np.float32)
+            out = apply_lut_cpu(np.clip(enc, 0.0, 1.0),
+                                np.ascontiguousarray(self.lut.table, dtype=np.float32))
+        else:
+            flat = img.reshape(-1, 3)
+            prophoto = (flat @ ACESCG_TO_PROPHOTO).reshape(img.shape)
+            prophoto = _apply_tone_curve(np.clip(prophoto, 0.0, 1.0))
+            lin = (prophoto.reshape(-1, 3) @ PROPHOTO_TO_LINSRGB).reshape(prophoto.shape)
+            out = _srgb_oetf(np.clip(lin, 0.0, 1.0))
+
+        post_gain = 2.0 ** (-pre_lut_ev)
+        if not np.isclose(post_gain, 1.0):
+            out = _srgb_oetf(np.clip(_srgb_eotf(np.clip(out, 0.0, 1.0)) * post_gain, 0.0, 1.0))
+
+        out = np.clip(out, 0.0, 1.0)
+        return 0.2126 * out[..., 0] + 0.7152 * out[..., 1] + 0.0722 * out[..., 2]
+
+    def auto_exposure_ev(self):
+        """The exposure (EV) that best exposes this image *through this LUT*.
+
+        Exposure is applied before the LUT and the LUT is non-linear, so there
+        is no closed form — this bisects on a thumbnail-sized render instead,
+        which is exact (it uses the real LUT) and costs a few milliseconds.
+
+        Two targets, and the darker wins: put the median at AE_TARGET_MEDIAN,
+        but never let the highlights past AE_HIGHLIGHT_MAX. That second clause
+        is what stops a LUT authored at a different input level from blowing the
+        frame out. Returns None when there is nothing to measure.
+        """
+        img = self.intermediate_acescg
+        if img is None or img.size == 0:
+            return None
+        try:
+            h, w = img.shape[:2]
+            step = max(1, int(max(h, w) / AE_PROBE_PX))
+            small = np.ascontiguousarray(img[::step, ::step], dtype=np.float32)
+            if small.ndim == 2:
+                small = small[:, :, None]
+            if small.shape[2] < 3:
+                small = np.repeat(small[:, :, :1], 3, axis=2)
+            if small.size == 0:
+                return None
+
+            def within(e):
+                """Both targets satisfied at this EV?
+
+                Median and highlight percentile are each monotonically
+                increasing in EV, so 'both are under their target' is itself
+                monotonic — one bisection lands on min(ev_median, ev_highlight)
+                directly, for half the probes of solving them separately.
+                """
+                luma = self._ae_probe_luma(small, e)
+                med, hi = np.percentile(luma, [50.0, AE_HIGHLIGHT_PCT])
+                return med <= AE_TARGET_MEDIAN and hi <= AE_HIGHLIGHT_MAX
+
+            lo, hi = AE_EV_MIN, AE_EV_MAX
+            if not within(lo):
+                return float(lo)            # blown even at the floor
+            if within(hi):
+                return float(hi)            # nothing bright enough to bind
+            for _ in range(AE_ITERS):
+                mid = 0.5 * (lo + hi)
+                if within(mid):
+                    lo = mid
+                else:
+                    hi = mid
+            return float(np.clip(lo, AE_EV_MIN, AE_EV_MAX))
+        except Exception:
+            log.exception("[processor] auto-exposure failed")
+            return None
+
     def render_preview(self, downscale=False):
         if self.intermediate_acescg is None:
             return None
@@ -865,7 +1029,17 @@ class FlashbackProcessor:
         t0  = time.time()
         v   = self.vibe          # film-stock parameters
         a   = self.adjustments   # per-image sliders
-        img = self.intermediate_acescg
+        # Straighten + crop first, so the frame-relative effects below (vignette,
+        # edge softness) centre on the cropped composition rather than the full
+        # sensor frame. No-op (returns the intermediate as-is) when unset.
+        img = crop_straighten(
+            self.intermediate_acescg,
+            angle_deg=float(getattr(a, 'straighten_deg', 0.0)),
+            scale=float(getattr(a, 'crop_scale', 1.0)),
+            cx=float(getattr(a, 'crop_cx', 0.5)),
+            cy=float(getattr(a, 'crop_cy', 0.5)),
+            apply_crop=self._apply_crop,
+        )
         if downscale:
             h, w = img.shape[:2]
             img = cv2.resize(img, (w // 3, h // 3), interpolation=cv2.INTER_LINEAR)
@@ -969,7 +1143,12 @@ class FlashbackProcessor:
                     if v.enable_softness and v.softness_sigma > 0:
                         with _timed("softness"):
                             img_display = apply_softness(img_display, v.softness_sigma)
-                    if v.enable_grain and v.grain_strength_pct > 0:
+                    if v.enable_grain and _grain_is_v3(v):
+                        _m = _grain_model(v)
+                        _fn = render_v4_cpu if _m == 'v4' else render_v3_cpu
+                        with _timed(f"grain {_m} (cpu)"):
+                            img_display = _fn(img_display, grain_v3_look(v))
+                    elif v.enable_grain and v.grain_strength_pct > 0:
                         img_display = self._apply_grain(
                             img_display, pct(v.grain_strength_pct),
                             highlight_bias=self._grain_highlight_bias(grain_driver),
@@ -1011,13 +1190,15 @@ class FlashbackProcessor:
 # =============================================================================
 
 def export_image(processor, output_path, quality=95, as_tiff=False,
-                 lut_profiling=False, reverse_ae=True):
+                 lut_profiling=False, reverse_ae=True, print_master=False):
     """Export JPEG or ACEScct TIFF from the current processor state.
 
-    Standard export produces a JPEG. TIFF export (lut_profiling=True, via the
-    advanced panel) encodes the ACEScg intermediate as ACEScct with the vibe's
-    base exposure offset applied — the level the app feeds the LUT at default
-    exposure — for LUT work in DaVinci Resolve.
+    Standard export produces a JPEG; with ``print_master`` it also writes a
+    16-bit sRGB TIFF beside it (the "Export for print" toggle). TIFF export
+    (lut_profiling=True, via the advanced panel) instead encodes the ACEScg
+    intermediate as ACEScct with the vibe's base exposure offset applied — the
+    level the app feeds the LUT at default exposure — for LUT work in DaVinci
+    Resolve.
 
     ``reverse_ae`` additionally undoes the camera's per-frame autoexposure (from
     EXIF ExposureTime, via _rev_gain_unconditional). That's only wanted when
@@ -1059,12 +1240,32 @@ def export_image(processor, output_path, quality=95, as_tiff=False,
     if img is None:
         return False
     img8 = np.clip(img * 255.0, 0, 255).astype(np.uint8)
+
+    # The JPEG is written at 4:4:4 (no chroma subsampling) and progressive —
+    # the extra bytes are cheap next to losing colour detail on a graded frame.
     try:
         from PIL import Image
-        Image.fromarray(img8, mode='RGB').save(output_path, 'JPEG',
-                                               quality=quality, optimize=True)
-        return True
+        Image.fromarray(img8, mode='RGB').save(
+            output_path, 'JPEG', quality=quality, optimize=True,
+            subsampling=0, progressive=True)
     except Exception:
         bgr = cv2.cvtColor(img8, cv2.COLOR_RGB2BGR)
-        return bool(cv2.imwrite(output_path, bgr,
-                                [cv2.IMWRITE_JPEG_QUALITY, quality]))
+        if not cv2.imwrite(output_path, bgr, [cv2.IMWRITE_JPEG_QUALITY, quality]):
+            return False
+
+    # Print master: a 16-bit sRGB TIFF of the same graded frame. Not the ACEScct
+    # LUT-profiling TIFF above — that one is scene-referred log for Resolve;
+    # this is display-referred, ready to print. LZW is lossless and every RIP
+    # reads it. 16-bit because print work gets pushed further than 8 bits
+    # survives. Best-effort: the JPEG already decided success/failure.
+    if print_master:
+        tiff_path = os.path.splitext(output_path)[0] + '.tiff'
+        try:
+            img16 = np.clip(img * 65535.0, 0, 65535).astype(np.uint16)
+            bgr16 = cv2.cvtColor(img16, cv2.COLOR_RGB2BGR)
+            if not cv2.imwrite(tiff_path, bgr16, [cv2.IMWRITE_TIFF_COMPRESSION, 5]):
+                log.warning("⚠ Print TIFF export failed for %s", tiff_path)
+        except Exception as e:
+            log.warning("⚠ Print TIFF export failed for %s: %s", tiff_path, e)
+
+    return True

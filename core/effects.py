@@ -15,6 +15,7 @@ upload/readback); these numpy functions are the oracle + no-GPU fallback.
 Halation is baked into the cached intermediate at load time (see
 processor.load_image) so it benefits both the live preview and export.
 """
+import math
 import numpy as np
 import cv2
 import time
@@ -22,6 +23,155 @@ import logging
 
 log = logging.getLogger(__name__)
 _resident_halation_warned = False
+
+
+# =============================================================================
+# GEOMETRY — straighten + crop
+# =============================================================================
+# Applied BEFORE the film look (see processor._render) so the frame-relative
+# effects (vignette, edge softness — both centred on the current frame) land on
+# the cropped composition rather than the full sensor frame. Non-destructive:
+# operates on a copy, driven entirely by the per-image ImageAdjustments fields.
+#
+# The crop is stored as `scale` (width as a fraction of the FULL frame width,
+# angle-independent), plus a normalised centre (cx, cy), locked to the frame's
+# aspect ratio. Because `scale` doesn't depend on the angle, a straighten keeps
+# the crop's size and only shrinks it when a corner would cross the rotated
+# frame edge — the crop is fitted to the rotated frame quad at render time.
+
+def frame_quad(w, h, angle_deg):
+    """Corners (dst-pixel coords) of the w×h frame after crop_straighten's
+    rotation — i.e. the boundary of real (non-border) image content.
+
+    Uses cv2's rotation-matrix convention with angle -angle_deg (matching the
+    warpAffine call), so the overlay and the renderer agree on the valid area.
+    """
+    rad = math.radians(-angle_deg)
+    a, b = math.cos(rad), math.sin(rad)
+    cx, cy = w / 2.0, h / 2.0
+    tx = (1.0 - a) * cx - b * cy
+    ty = b * cx + (1.0 - a) * cy
+    m = lambda x, y: (a * x + b * y + tx, -b * x + a * y + ty)
+    return [m(0, 0), m(w, 0), m(w, h), m(0, h)]
+
+
+def point_in_quad(p, quad, tol=1e-6):
+    """True if point p is inside the convex polygon `quad` (consistent winding)."""
+    px, py = p
+    s = 0
+    n = len(quad)
+    for i in range(n):
+        x1, y1 = quad[i]
+        x2, y2 = quad[(i + 1) % n]
+        cross = (x2 - x1) * (py - y1) - (y2 - y1) * (px - x1)
+        if cross < -tol:
+            if s > 0:
+                return False
+            s = -1
+        elif cross > tol:
+            if s < 0:
+                return False
+            s = 1
+    return True
+
+
+def rect_in_quad(x0, y0, x1, y1, quad):
+    """True if the axis-aligned rect's four corners all lie inside `quad`."""
+    return all(point_in_quad(c, quad)
+               for c in ((x0, y0), (x1, y0), (x1, y1), (x0, y1)))
+
+
+def _bsearch_max_fit(fits, iters=24):
+    """Largest t in (0, 1] with fits(t) true (fits monotonic in t). 1.0 fast path."""
+    if fits(1.0):
+        return 1.0
+    lo, hi = 0.0, 1.0
+    for _ in range(iters):
+        mid = (lo + hi) / 2.0
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid
+    return lo
+
+
+def effective_crop(w, h, angle_deg, scale, cx, cy):
+    """The crop rect actually applied, as (x0, y0, x1, y1) in dst-pixel coords.
+
+    `scale` is the crop width as a fraction of the full frame width `w` (so it is
+    angle-independent). The desired rect is centred at normalised (cx, cy); if a
+    corner would spill past the rotated frame edge it's shrunk about its centre
+    just enough to fit. At scale=1, angle=0 this is the whole frame.
+    """
+    ar = w / h
+    scale = max(1e-3, min(float(scale), 1.0))
+    dw = scale * w
+    dh = dw / ar
+    ccx, ccy = cx * w, cy * h
+    quad = frame_quad(w, h, angle_deg)
+
+    hw, hh = dw / 2.0, dh / 2.0
+    fcx, fcy = w / 2.0, h / 2.0
+
+    def fits_at(cx_, cy_, s=1.0):
+        return rect_in_quad(cx_ - hw * s, cy_ - hh * s,
+                            cx_ + hw * s, cy_ + hh * s, quad)
+
+    # Requested position works — nothing to do.
+    if fits_at(ccx, ccy):
+        return (ccx - hw, ccy - hh, ccx + hw, ccy + hh)
+
+    # Otherwise SLIDE toward the frame centre before shrinking: the requested
+    # crop size is the composition the user chose, so it is the last thing to
+    # give up. Only when the box cannot fit anywhere — too big for the rotated
+    # frame — does it shrink, and then about the centre where it fits best.
+    if fits_at(fcx, fcy):
+        t = _bsearch_max_fit(
+            lambda k: fits_at(fcx + (ccx - fcx) * k, fcy + (ccy - fcy) * k))
+        cx_ = fcx + (ccx - fcx) * t
+        cy_ = fcy + (ccy - fcy) * t
+        return (cx_ - hw, cy_ - hh, cx_ + hw, cy_ + hh)
+
+    s = _bsearch_max_fit(lambda k: fits_at(fcx, fcy, k))
+    return (fcx - hw * s, fcy - hh * s, fcx + hw * s, fcy + hh * s)
+
+
+def crop_straighten(img, angle_deg=0.0, scale=1.0, cx=0.5, cy=0.5, apply_crop=True):
+    """Straighten then crop ``img`` (never mutates the input).
+
+    ``angle_deg`` rotates the image about its centre (positive = clockwise).
+    ``scale`` is the crop width as a fraction of the FULL frame width, positioned
+    by ``cx``/``cy`` (normalised centre) and locked to the frame aspect ratio.
+    With ``apply_crop=False`` the rotated full frame is returned (crop-edit
+    preview); the UI overlays the crop box and covers the exposed corners.
+
+    Returns ``img`` unchanged when nothing is set, so the common no-crop path
+    costs one comparison and no resample.
+    """
+    no_straighten = abs(angle_deg) < 1e-4
+    no_crop = scale >= 0.999 and abs(cx - 0.5) < 1e-4 and abs(cy - 0.5) < 1e-4
+    if no_straighten and (no_crop or not apply_crop):
+        return img
+
+    h, w = img.shape[:2]
+    if not no_straighten:
+        # cv2 rotates counter-clockwise for positive angles; negate so a positive
+        # angle_deg reads as clockwise. The committed crop excludes the exposed
+        # corners; in crop-edit mode the UI paints the art board over them.
+        m = cv2.getRotationMatrix2D((w / 2.0, h / 2.0), -angle_deg, 1.0)
+        img = cv2.warpAffine(img, m, (w, h), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_REPLICATE)
+    if not apply_crop:
+        return img
+
+    x0, y0, x1, y1 = effective_crop(w, h, angle_deg, scale, cx, cy)
+    x0 = max(0, int(round(x0)))
+    y0 = max(0, int(round(y0)))
+    x1 = min(w, int(round(x1)))
+    y1 = min(h, int(round(y1)))
+    if x1 - x0 < 1 or y1 - y0 < 1:
+        return img
+    return np.ascontiguousarray(img[y0:y1, x0:x1])
 
 from .kernels import (
     apply_lut_gpu,

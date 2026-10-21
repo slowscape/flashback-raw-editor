@@ -25,16 +25,17 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QTimer, QSize, Signal, QThread, QEvent, QPropertyAnimation, QEasingCurve,
-    QPoint, QPointF,
+    QPoint, QPointF, QRectF,
 )
 from PySide6.QtGui import (
-    QPixmap, QImage, QPainter, QColor, QPen, QCursor, QLinearGradient,
-    QMovie, QPainterPath, QColorSpace, QFont,
+    QPixmap, QImage, QPainter, QColor, QPen, QBrush, QCursor, QLinearGradient,
+    QMovie, QPainterPath, QPolygonF, QColorSpace, QFont,
 )
 
 from core import resource_path
 from core.gpu import gpu
 from core.processor import FlashbackProcessor
+from core.effects import effective_crop, frame_quad, rect_in_quad
 from core.config import _timing_print
 from core.v1_negative import is_v1_negative
 from ui.theme import C, qcolor, register_theme_listener, ui_font, UI_FONT
@@ -975,13 +976,28 @@ class ThumbnailStrip(QScrollArea):
 # ROUNDED LABEL
 # =============================================================================
 
+def crop_rect_px(pw, ph, scale, cx, cy, angle):
+    """The effective crop rect as a QRectF in pixmap-pixel space (fitted to the
+    rotated frame). Shared by the overlay painter and drag hit-testing."""
+    x0, y0, x1, y1 = effective_crop(pw, ph, angle, scale, cx, cy)
+    return QRectF(x0, y0, x1 - x0, y1 - y0)
+
+
+def _quad_polygon(pw, ph, angle, ox, oy):
+    """The rotated-frame quad (valid image area) as a QPolygonF in label coords."""
+    return QPolygonF([QPointF(ox + x, oy + y) for (x, y) in frame_quad(pw, ph, angle)])
+
+
 class RoundedLabel(QLabel):
-    """QLabel with anti-aliased rounded corners."""
+    """QLabel with anti-aliased rounded corners, plus an optional crop overlay
+    (art-board corners, dimmed exterior, rule-of-thirds grid, handles) on top."""
 
     def __init__(self, parent=None, radius=12):
         super().__init__(parent)
         self._radius = radius
         self._pixmap = None
+        self._crop_active = False
+        self._crop = (1.0, 0.5, 0.5, 0.0)  # scale, cx, cy, angle
         self.setAlignment(Qt.AlignCenter)
         register_theme_listener(self.update)
 
@@ -991,6 +1007,11 @@ class RoundedLabel(QLabel):
 
     def pixmap(self):
         return self._pixmap
+
+    def set_crop_overlay(self, active, scale=1.0, cx=0.5, cy=0.5, angle=0.0):
+        self._crop_active = active
+        self._crop = (scale, cx, cy, angle)
+        self.update()
 
     def paintEvent(self, event):
         painter = QPainter(self)
@@ -1002,12 +1023,53 @@ class RoundedLabel(QLabel):
         painter.setClipPath(path)
         painter.fillRect(self.rect(), qcolor("bg_window"))
 
+        ox = oy = 0
         if self._pixmap:
-            x = (self.width() - self._pixmap.width()) // 2
-            y = (self.height() - self._pixmap.height()) // 2
-            painter.drawPixmap(x, y, self._pixmap)
+            ox = (self.width() - self._pixmap.width()) // 2
+            oy = (self.height() - self._pixmap.height()) // 2
+            painter.drawPixmap(ox, oy, self._pixmap)
+
+        if self._crop_active and self._pixmap:
+            self._paint_crop(painter, ox, oy)
 
         painter.end()
+
+    def _paint_crop(self, painter, ox, oy):
+        pw, ph = self._pixmap.width(), self._pixmap.height()
+        scale, cx, cy, angle = self._crop
+        crop = crop_rect_px(pw, ph, scale, cx, cy, angle).translated(ox, oy)
+        full = QRectF(ox, oy, pw, ph)
+
+        full_path = QPainterPath(); full_path.addRect(full)
+        quad_path = QPainterPath()
+        quad_path.addPolygon(_quad_polygon(pw, ph, angle, ox, oy))
+        quad_path.closeSubpath()
+        crop_path = QPainterPath(); crop_path.addRect(crop)
+
+        # (bug #3) Straighten exposes triangular corners; the warpAffine smears
+        # the edge into them. Paint the art-board colour over everything outside
+        # the real image quad so the board shows there instead of a smear.
+        painter.fillPath(full_path.subtracted(quad_path), qcolor("bg_window"))
+        # Dim the real image that falls outside the crop (leaves the board alone).
+        painter.fillPath(quad_path.subtracted(crop_path), QColor(0, 0, 0, 120))
+
+        # Rule-of-thirds grid.
+        painter.setPen(QPen(QColor(255, 255, 255, 90), 1))
+        for i in (1, 2):
+            x = crop.left() + crop.width() * i / 3.0
+            y = crop.top() + crop.height() * i / 3.0
+            painter.drawLine(QPointF(x, crop.top()), QPointF(x, crop.bottom()))
+            painter.drawLine(QPointF(crop.left(), y), QPointF(crop.right(), y))
+
+        # Border + corner handles.
+        painter.setPen(QPen(QColor(255, 255, 255, 220), 1.5))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(crop)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(QColor(255, 255, 255, 235)))
+        hs = 4.0
+        for pt in (crop.topLeft(), crop.topRight(), crop.bottomLeft(), crop.bottomRight()):
+            painter.drawRect(QRectF(pt.x() - hs, pt.y() - hs, hs * 2, hs * 2))
 
 
 # =============================================================================
@@ -1036,6 +1098,21 @@ class ZoomableImageWidget(QScrollArea):
         self._fit_to_window = True
         self._panning = False
         self._last_mouse_pos = None
+
+        # Crop mode: when active, mouse manipulates the crop box instead of
+        # zoom/pan, and the image stays fit-to-window (no zoom). The canonical
+        # crop is (scale, cx, cy) normalised to the full straightened frame;
+        # `angle` sets the valid bounds. on_crop_changed(scale, cx, cy) fires on
+        # drag release so the editor can persist it.
+        self._crop_mode = False
+        self._crop_scale = 1.0
+        self._crop_cx = 0.5
+        self._crop_cy = 0.5
+        self._crop_angle = 0.0
+        self._crop_drag = None          # None | 'move' | 'nw'|'ne'|'sw'|'se'
+        self._crop_drag_start = None    # QPointF, label coords
+        self._crop_start = None         # (scale, cx, cy) snapshot at press
+        self.on_crop_changed = None
 
         self._zoom_cursor = self._create_zoom_cursor()
 
@@ -1260,8 +1337,140 @@ class ZoomableImageWidget(QScrollArea):
         else:
             self.image_label.setCursor(self._zoom_cursor)
 
+    # ---- crop mode ------------------------------------------------------------
+
+    def enter_crop_mode(self, scale, cx, cy, angle):
+        """Show the crop box over the (already full-frame) image and take over
+        mouse handling. Forces fit-to-window so all four corners are reachable."""
+        self._crop_mode = True
+        self._crop_scale, self._crop_cx, self._crop_cy = scale, cx, cy
+        self._crop_angle = angle
+        self._crop_drag = None
+        self._fit_to_window = True
+        self._update_display()
+        self._push_crop_overlay()
+        self.image_label.setCursor(Qt.ArrowCursor)
+
+    def exit_crop_mode(self):
+        self._crop_mode = False
+        self._crop_drag = None
+        self.image_label.set_crop_overlay(False)
+        self._update_cursor()
+
+    def set_crop_angle(self, angle):
+        """Straighten changed while cropping: update the valid bounds + repaint
+        (the box is re-clamped inside the new rotated frame on next paint)."""
+        self._crop_angle = angle
+        if self._crop_mode:
+            self._push_crop_overlay()
+
+    def _push_crop_overlay(self):
+        self.image_label.set_crop_overlay(
+            True, self._crop_scale, self._crop_cx, self._crop_cy, self._crop_angle)
+
+    def _crop_label_pos(self, event):
+        return QPointF(self.image_label.mapFrom(self.viewport(), event.pos()))
+
+    def _crop_hit(self, lp):
+        pm = self.image_label._pixmap
+        if pm is None:
+            return None
+        crop = crop_rect_px(pm.width(), pm.height(),
+                            self._crop_scale, self._crop_cx, self._crop_cy, self._crop_angle)
+        tol = 12.0
+        corners = {'nw': crop.topLeft(), 'ne': crop.topRight(),
+                   'sw': crop.bottomLeft(), 'se': crop.bottomRight()}
+        for name, pt in corners.items():
+            if abs(lp.x() - pt.x()) <= tol and abs(lp.y() - pt.y()) <= tol:
+                return name
+        if crop.contains(lp):
+            return 'move'
+        return None
+
+    _CROP_CURSORS = {
+        'nw': Qt.SizeFDiagCursor, 'se': Qt.SizeFDiagCursor,
+        'ne': Qt.SizeBDiagCursor, 'sw': Qt.SizeBDiagCursor,
+        'move': Qt.SizeAllCursor,
+    }
+
+    @staticmethod
+    def _bsearch_fit(fits, iters=20):
+        """Largest t in [0,1] with fits(t) true (fits monotonic). 1.0 fast path."""
+        if fits(1.0):
+            return 1.0
+        lo, hi = 0.0, 1.0
+        for _ in range(iters):
+            mid = (lo + hi) / 2.0
+            if fits(mid):
+                lo = mid
+            else:
+                hi = mid
+        return lo
+
+    def _apply_crop_drag(self, lp):
+        pm = self.image_label._pixmap
+        if pm is None:
+            return
+        pw, ph = pm.width(), pm.height()
+        ar = pw / ph                       # crop aspect == frame aspect
+        quad = frame_quad(pw, ph, self._crop_angle)
+        start = crop_rect_px(pw, ph, *self._crop_start, self._crop_angle)
+
+        if self._crop_drag == 'move':
+            # Slide from the (valid) start centre toward the cursor as far as the
+            # fixed-size box fits inside the rotated frame — size never changes.
+            sw, sh = start.width(), start.height()
+            sc = start.center()
+            dcx = sc.x() + (lp.x() - self._crop_drag_start.x())
+            dcy = sc.y() + (lp.y() - self._crop_drag_start.y())
+
+            def fits(t):
+                ccx = sc.x() + (dcx - sc.x()) * t
+                ccy = sc.y() + (dcy - sc.y()) * t
+                return rect_in_quad(ccx - sw / 2, ccy - sh / 2,
+                                    ccx + sw / 2, ccy + sh / 2, quad)
+            t = self._bsearch_fit(fits)
+            ccx = sc.x() + (dcx - sc.x()) * t
+            ccy = sc.y() + (dcy - sc.y()) * t
+            rect = QRectF(ccx - sw / 2, ccy - sh / 2, sw, sh)
+        else:
+            # Corner resize: opposite corner fixed, aspect locked, grown toward
+            # the cursor but never past the rotated frame edge.
+            anchor = {'nw': start.bottomRight(), 'ne': start.bottomLeft(),
+                      'sw': start.topRight(), 'se': start.topLeft()}[self._crop_drag]
+            min_w = pw * 0.05
+            desired_w = max(abs(lp.x() - anchor.x()), abs(lp.y() - anchor.y()) * ar)
+            desired_w = max(min_w, min(desired_w, float(pw)))
+
+            def rect_for_w(wd):
+                hd = wd / ar
+                left = anchor.x() if self._crop_drag in ('ne', 'se') else anchor.x() - wd
+                top = anchor.y() if self._crop_drag in ('sw', 'se') else anchor.y() - hd
+                return QRectF(left, top, wd, hd)
+
+            def fits(t):
+                r = rect_for_w(min_w + (desired_w - min_w) * t)
+                return rect_in_quad(r.left(), r.top(), r.right(), r.bottom(), quad)
+            t = self._bsearch_fit(fits)
+            rect = rect_for_w(min_w + (desired_w - min_w) * t)
+
+        self._crop_scale = rect.width() / pw
+        self._crop_cx = rect.center().x() / pw
+        self._crop_cy = rect.center().y() / ph
+        self._push_crop_overlay()
+
+    # ---- mouse ----------------------------------------------------------------
+
     def mousePressEvent(self, event):
         if self._original_pixmap is None:
+            return
+
+        if self._crop_mode:
+            if event.button() == Qt.LeftButton and self.image_label._pixmap:
+                lp = self._crop_label_pos(event)
+                self._crop_drag = self._crop_hit(lp)
+                self._crop_drag_start = lp
+                self._crop_start = (self._crop_scale, self._crop_cx, self._crop_cy)
             return
 
         if event.button() == Qt.LeftButton:
@@ -1276,6 +1485,16 @@ class ZoomableImageWidget(QScrollArea):
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
+        if self._crop_mode:
+            if self.image_label._pixmap:
+                lp = self._crop_label_pos(event)
+                if self._crop_drag:
+                    self._apply_crop_drag(lp)
+                else:
+                    hit = self._crop_hit(lp)
+                    self.image_label.setCursor(self._CROP_CURSORS.get(hit, Qt.ArrowCursor))
+            return
+
         if self._panning and self._last_mouse_pos:
             delta = event.pos() - self._last_mouse_pos
             self._last_mouse_pos = event.pos()
@@ -1287,6 +1506,13 @@ class ZoomableImageWidget(QScrollArea):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event):
+        if self._crop_mode:
+            if event.button() == Qt.LeftButton and self._crop_drag:
+                self._crop_drag = None
+                if self.on_crop_changed:
+                    self.on_crop_changed(self._crop_scale, self._crop_cx, self._crop_cy)
+            return
+
         if event.button() == Qt.LeftButton and self._panning:
             self._panning = False
             self._update_cursor()
@@ -1294,6 +1520,8 @@ class ZoomableImageWidget(QScrollArea):
         super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
+        if self._crop_mode:
+            return
         if event.button() == Qt.LeftButton:
             self._fit_to_window = True
             self._update_display()
@@ -1303,6 +1531,9 @@ class ZoomableImageWidget(QScrollArea):
 
     def wheelEvent(self, event):
         if self._original_pixmap is None:
+            return
+        if self._crop_mode:      # no zoom while cropping
+            event.accept()
             return
 
         delta = event.angleDelta().y()
@@ -1345,6 +1576,10 @@ class VibePicker(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        # Instance copy: the class-level VIBES stays the 5 factory presets;
+        # add_custom_vibe() appends here so custom looks (F12 "Save As") show
+        # up in the picker without touching the shared default.
+        self.VIBES = list(VibePicker.VIBES)
         self._current = 'disposable'
         self._setup_ui()
         register_theme_listener(self._apply_theme)
@@ -1358,6 +1593,14 @@ class VibePicker(QWidget):
         self._current = vibe_id
         self._update_display()
         self.vibe_changed.emit(vibe_id)
+
+    def add_custom_vibe(self, vibe_id: str, name: str, subtitle: str = "Custom"):
+        """Register a user-saved vibe (F12 "Save As") so it shows in the
+        picker alongside the factory presets. No hotkey (those are fixed to
+        the 5 factory ids). No-op if the id is already present."""
+        if any(v[0] == vibe_id for v in self.VIBES):
+            return
+        self.VIBES = self.VIBES + [(vibe_id, name, subtitle, '')]
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)

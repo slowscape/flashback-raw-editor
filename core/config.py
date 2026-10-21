@@ -371,6 +371,26 @@ class VibeConfig:
     bloom_strength_pct: float = BLOOM_STRENGTH_PCT              # 0–100
     bloom_threshold_stops: float = BLOOM_THRESHOLD_STOPS        # EV above mid grey
 
+    # ---- grain model ----
+    # 'standard' = the tiled noise layer blended over the picture
+    #              (effects.apply_grain, the original look).
+    # 'v3'       = Film Grain v3: the picture is rebuilt out of silver clumps,
+    #              an emulsion model (core/grain_v3.py), stamped from a library
+    #              of 128 pre-drawn clump shapes.
+    # 'v4'       = the same emulsion with no library at all (core/grain_v4.py):
+    #              every clump grows its own crystals, so no two are alike.
+    # The grain_v3_* fields below are the five emulsion controls and are SHARED
+    # by v3 and v4 — they describe the film, not the engine, so switching model
+    # keeps your settings. They are ignored by 'standard'; likewise
+    # grain_strength_pct is ignored by v3/v4, which carry their own strength.
+    # `enable_grain` is the master switch for all three.
+    grain_model: str = 'standard'
+    grain_v3_stock: str = 'Tri-X 400'
+    grain_v3_format: str = '35mm'
+    grain_v3_strength_pct: float = 100.0   # 0–150; 100 = the emulsion as it comes
+    grain_v3_mono: bool = False
+    grain_v3_variation: int = 1            # 1–40; another roll of the same film
+
     # ---- reverse-AE (advanced) ----
     enable_reverse_autoexposure: bool = False
     reverse_autoexposure_t_ref: float = 1e-3
@@ -399,6 +419,11 @@ class VibeConfig:
     # re-import their original .cube once they've regenerated it against
     # the v2 color pipeline. Cleared once the user re-imports a LUT.
     legacy_user_lut: str = ''
+
+    # User-facing label for a custom vibe saved via "Save As" (F12 panel).
+    # Empty for the 5 factory vibes, whose names live in ui.widgets.VibePicker.
+    # Purely cosmetic — never read by the render pipeline.
+    display_name: str = ''
 
     # ---- serialization ----
     def to_dict(self) -> dict:
@@ -440,6 +465,16 @@ class ImageAdjustments:
     tint: float = 0.0
     push_pull_ev: float = 0.0
     rotation: int = 0
+    # Crop + straighten (JPEG export only; the raw DNG passthrough ignores them).
+    # Non-destructive — applied at render time, never baked into the intermediate.
+    # straighten_deg rotates the image about its centre (positive = clockwise).
+    # The crop is locked to the original aspect ratio: crop_scale is the fraction
+    # of the largest rect that fits at the current angle (1.0 = full frame), and
+    # crop_cx/crop_cy position its centre in normalised [0,1] image coordinates.
+    straighten_deg: float = 0.0
+    crop_scale: float = 1.0
+    crop_cx: float = 0.5
+    crop_cy: float = 0.5
     active_vibe_id: str = ''   # filled in by the editor when an image loads
 
     def to_dict(self) -> dict:

@@ -16,6 +16,7 @@ The LUT buffer is persistent on the GPU — upload once per vibe change.
 """
 from __future__ import annotations
 import logging
+import math
 import os
 import struct
 import threading
@@ -193,6 +194,14 @@ class GPUPipeline:
         self._unsharp_tex_bg_layout = None
         self._grain_tex_pipeline = None    # texture-resident grain blend
         self._grain_tex_bg_layout = None
+        self._gv3_tilekeep_pipeline = None  # Film Grain v3: per-tile reduction
+        self._gv3_tilekeep_bg_layout = None
+        self._gv3_scatter_pipeline = None   # Film Grain v3: clump scatter (atomics)
+        self._gv3_scatter_bg_layout = None
+        self._gv3_resolve_pipeline = None   # Film Grain v3: silver -> picture
+        self._gv3_resolve_bg_layout = None
+        self._gv4_scatter_pipeline = None   # Film Grain v4: library-free scatter
+        self._gv4_scatter_bg_layout = None
         self._ca_tex_pipeline = None       # texture-resident spectral CA
         self._ca_tex_bg_layout = None
         self._edge_soft_pipeline = None    # texture-resident edge (corner) softness
@@ -396,6 +405,10 @@ class GPUPipeline:
         ('unsharp_tex.wgsl',       'TTSU',  '_unsharp_tex_bg_layout', (('_unsharp_tex_pipeline', 'main'),)),
         ('ca_tex.wgsl',            'TSU',   '_ca_tex_bg_layout',      (('_ca_tex_pipeline', 'main'),)),
         ('grain_tex.wgsl',         'TTSU',  '_grain_tex_bg_layout',   (('_grain_tex_pipeline', 'main'),)),
+        ('grain_v3_tilekeep.wgsl', 'TWU',   '_gv3_tilekeep_bg_layout', (('_gv3_tilekeep_pipeline', 'main'),)),
+        ('grain_v3_scatter.wgsl', 'TRRRRRWU', '_gv3_scatter_bg_layout', (('_gv3_scatter_pipeline', 'main'),)),
+        ('grain_v3_resolve.wgsl',  'TRSU',  '_gv3_resolve_bg_layout', (('_gv3_resolve_pipeline', 'main'),)),
+        ('grain_v4_scatter.wgsl',  'TRRWU', '_gv4_scatter_bg_layout', (('_gv4_scatter_pipeline', 'main'),)),
         ('edge_softness_tex.wgsl', 'TTSU',  '_edge_soft_bg_layout',   (('_edge_soft_pipeline', 'main'),)),
         ('vignette_tex.wgsl',      'TSU',   '_vignette_bg_layout',    (('_vignette_pipeline', 'main'),)),
         ('bloom_downmask.wgsl',    'TSU',   '_bloom_dm_bg_layout',    (('_bloom_dm_pipeline', 'main'),)),
@@ -469,6 +482,18 @@ class GPUPipeline:
 
     def _upload(self, arr: np.ndarray):
         data = np.ascontiguousarray(arr.astype(np.float32)).ravel()
+        return self._device.create_buffer_with_data(
+            data=data.tobytes(),
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
+        )
+
+    def _upload_raw(self, arr: np.ndarray):
+        """Upload an array's bytes verbatim (no float32 cast).
+
+        _upload coerces to float32, which is right for image data but destroys
+        the u32 index/count buffers the Film Grain v3 scatter pass needs.
+        """
+        data = np.ascontiguousarray(arr)
         return self._device.create_buffer_with_data(
             data=data.tobytes(),
             usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC,
@@ -914,6 +939,215 @@ class GPUPipeline:
         ])
         self._run2d(self._grain_tex_pipeline, bg, w, h)
         return Frame.from_gpu(dst, frame.shape, self)
+
+    # ---- Film Grain v3 / v4 -------------------------------------------------
+    #
+    # Both models share the outer two passes: a per-tile reduction that lets the
+    # host draw Poisson clump counts without pulling the image back, and a
+    # resolve that turns accumulated silver into the picture. Only the scatter
+    # in the middle differs — v3 stamps a patch library, v4 grows each clump
+    # crystal by crystal (see core/grain_v3.py and core/grain_v4.py).
+
+    def _grain_tiles(self, frame: "Frame"):
+        """Pass A, shared: per-tile max `keep` and max chroma deviation.
+
+        Returns (ntx, nty, n_tiles, tile_keep, is_grey), or None when the frame
+        is outside what the dispatch can address.
+        """
+        from . import grain_v3 as g3
+        h, w = frame.shape[:2]
+        ntx = -(-w // g3.TILE)
+        nty = -(-h // g3.TILE)
+        n_tiles = ntx * nty
+        # dispatch_workgroups is limited to 65535 per dimension; n_tiles rides
+        # the Y axis. Well past any frame this app renders, but guard anyway.
+        if n_tiles > 65535 or n_tiles == 0:
+            return None
+
+        span = g3.CEIL - g3.FLOOR
+        log_ceil = math.log1p(-g3.CEIL)
+        tk_buf = self._device.create_buffer(
+            size=n_tiles * 8,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+        uni_a = self._uniform(struct.pack(
+            '4I4f', w, h, ntx, nty, span, g3.FLOOR, log_ceil, float(g3.TILE)))
+        bg_a = self._device.create_bind_group(layout=self._gv3_tilekeep_bg_layout, entries=[
+            {'binding': 0, 'resource': frame.gpu().create_view()},
+            {'binding': 1, 'resource': {'buffer': tk_buf, 'offset': 0, 'size': tk_buf.size}},
+            {'binding': 2, 'resource': {'buffer': uni_a, 'offset': 0, 'size': uni_a.size}},
+        ])
+        enc = self._device.create_command_encoder()
+        cp = enc.begin_compute_pass()
+        cp.set_pipeline(self._gv3_tilekeep_pipeline)
+        cp.set_bind_group(0, bg_a)
+        cp.dispatch_workgroups((n_tiles + 63) // 64)
+        cp.end()
+        self._device.queue.submit([enc.finish()])
+
+        tk = self._download(tk_buf, (n_tiles, 2))
+        tile_keep = np.ascontiguousarray(tk[:, 0]).reshape(nty, ntx)
+        is_grey = bool(tk[:, 1].max() < 1e-4)
+        return ntx, nty, n_tiles, tile_keep, is_grey
+
+    def _grain_resolve(self, frame: "Frame", accum, prep, cw):
+        """Pass C, shared: accumulated silver -> the picture."""
+        from . import grain_v3 as g3
+        h, w = frame.shape[:2]
+        span = g3.CEIL - g3.FLOOR
+        dst = self._create_tex(frame.shape)
+        ch = prep['channels']
+        uni_c = self._uniform(struct.pack(
+            '4I4f4f4I',
+            w, h, cw, g3.SAMPLES,
+            span, g3.FLOOR, float(g3.ACCUM_SCALE), g3.LIFT,
+            prep['strength'], ch[0], ch[1], ch[2],
+            1 if prep['mono'] else 0, 0, 0, 0))
+        bg_c = self._device.create_bind_group(layout=self._gv3_resolve_bg_layout, entries=[
+            {'binding': 0, 'resource': frame.gpu().create_view()},
+            {'binding': 1, 'resource': {'buffer': accum, 'offset': 0, 'size': accum.size}},
+            {'binding': 2, 'resource': dst.create_view()},
+            {'binding': 3, 'resource': {'buffer': uni_c, 'offset': 0, 'size': uni_c.size}},
+        ])
+        self._run2d(self._gv3_resolve_pipeline, bg_c, w, h)
+        return Frame.from_gpu(dst, frame.shape, self)
+
+    def _grain_accum_buffer(self, cw, chh):
+        """The fixed-point log accumulator both scatters write into."""
+        return self._device.create_buffer(
+            size=cw * chh * 4,
+            usage=wgpu.BufferUsage.STORAGE | wgpu.BufferUsage.COPY_SRC)
+
+    def grain_v3_frame(self, frame: "Frame", look):
+        """Film Grain v3, texture-resident: Frame in -> Frame out.
+
+        Rebuilds the picture out of silver (see core/grain_v3.py) in three
+        passes — per-tile reduction, clump scatter, resolve+composite. Returns
+        None if the GPU is unavailable or the frame is outside what the dispatch
+        can address, so the caller can fall back to the numpy path.
+
+        Only one small readback happens (2 floats per 32x32 tile), so the image
+        never leaves the GPU: the Poisson clump counts are drawn on the host
+        from that reduction and uploaded again.
+        """
+        if not self._init():
+            return None
+        from . import grain_v3 as g3
+
+        tiles = self._grain_tiles(frame)
+        if tiles is None:
+            return None
+        ntx, nty, n_tiles, tile_keep, is_grey = tiles
+
+        h, w = frame.shape[:2]
+        span = g3.CEIL - g3.FLOOR
+        log_ceil = math.log1p(-g3.CEIL)
+
+        # ---- host: the library, and this frame's Poisson clump counts ----
+        prep = g3.plan_gpu(look, (h, w), tile_keep, is_grey)
+        counts = prep['counts'].astype(np.uint32).ravel()
+        max_count = int(counts.max()) if counts.size else 0
+        if max_count == 0:
+            return frame                      # nothing to draw (pure black frame)
+        if (max_count + 63) // 64 > 65535:
+            return None                       # too many clumps for one dispatch
+
+        cw, chh = w * g3.SAMPLES, h * g3.SAMPLES
+        accum = self._grain_accum_buffer(cw, chh)
+
+        # ---- pass B: scatter (stamp the patch library) ----
+        uni_b = self._uniform(struct.pack(
+            '4I4I4f4I',
+            w, h, cw, chh,
+            ntx, nty, prep['seed'], prep['size'] // 2,
+            span, g3.FLOOR, log_ceil, float(g3.ACCUM_SCALE),
+            g3.SHAPES, g3.TILE, g3.SAMPLES, max_count))
+        bg_b = self._device.create_bind_group(layout=self._gv3_scatter_bg_layout, entries=[
+            {'binding': 0, 'resource': frame.gpu().create_view()},
+            {'binding': 1, 'resource': {'buffer': self._upload_raw(counts), 'offset': 0,
+                                        'size': counts.nbytes}},
+            {'binding': 2, 'resource': {'buffer': self._upload_raw(
+                np.ascontiguousarray(tile_keep.ravel(), dtype=np.float32)),
+                'offset': 0, 'size': n_tiles * 4}},
+            {'binding': 3, 'resource': {'buffer': self._upload_raw(prep['start']), 'offset': 0,
+                                        'size': prep['start'].nbytes}},
+            {'binding': 4, 'resource': {'buffer': self._upload_raw(prep['off']), 'offset': 0,
+                                        'size': prep['off'].nbytes}},
+            {'binding': 5, 'resource': {'buffer': self._upload_raw(prep['val']), 'offset': 0,
+                                        'size': prep['val'].nbytes}},
+            {'binding': 6, 'resource': {'buffer': accum, 'offset': 0, 'size': accum.size}},
+            {'binding': 7, 'resource': {'buffer': uni_b, 'offset': 0, 'size': uni_b.size}},
+        ])
+        enc = self._device.create_command_encoder()
+        cp = enc.begin_compute_pass()
+        cp.set_pipeline(self._gv3_scatter_pipeline)
+        cp.set_bind_group(0, bg_b)
+        cp.dispatch_workgroups((max_count + 63) // 64, n_tiles)
+        cp.end()
+        self._device.queue.submit([enc.finish()])
+
+        return self._grain_resolve(frame, accum, prep, cw)
+
+    def grain_v4_frame(self, frame: "Frame", look):
+        """Film Grain v4, texture-resident: Frame in -> Frame out.
+
+        The same three passes as v3, sharing the same outer two shaders; only
+        the scatter differs. v4 uploads nothing but the per-tile clump counts —
+        there is no patch library — and grows every clump crystal by crystal in
+        the shader, so each clump is unique rather than one of 128 reused
+        shapes.
+        """
+        if not self._init():
+            return None
+        from . import grain_v3 as g3
+        from . import grain_v4 as g4
+
+        tiles = self._grain_tiles(frame)
+        if tiles is None:
+            return None
+        ntx, nty, n_tiles, tile_keep, is_grey = tiles
+
+        h, w = frame.shape[:2]
+        span = g3.CEIL - g3.FLOOR
+        log_ceil = math.log1p(-g3.CEIL)
+
+        prep = g4.plan_gpu_v4(look, (h, w), tile_keep, is_grey)
+        counts = prep['counts'].astype(np.uint32).ravel()
+        max_count = int(counts.max()) if counts.size else 0
+        if max_count == 0:
+            return frame
+        if (max_count + 63) // 64 > 65535:
+            return None
+
+        cw, chh = w * g3.SAMPLES, h * g3.SAMPLES
+        accum = self._grain_accum_buffer(cw, chh)
+
+        # ---- pass B: scatter (grow the crystals) ----
+        uni_b = self._uniform(struct.pack(
+            '4I4I4f4f4I',
+            w, h, cw, chh,
+            ntx, nty, prep['seed'], g4.MAX_CRYSTALS,
+            span, g3.FLOOR, log_ceil, float(g3.ACCUM_SCALE),
+            prep['spread'], prep['radius'], prep['opacity'], prep['per_clump'],
+            g3.TILE, g3.SAMPLES, 0, 0))
+        bg_b = self._device.create_bind_group(layout=self._gv4_scatter_bg_layout, entries=[
+            {'binding': 0, 'resource': frame.gpu().create_view()},
+            {'binding': 1, 'resource': {'buffer': self._upload_raw(counts), 'offset': 0,
+                                        'size': counts.nbytes}},
+            {'binding': 2, 'resource': {'buffer': self._upload_raw(
+                np.ascontiguousarray(tile_keep.ravel(), dtype=np.float32)),
+                'offset': 0, 'size': n_tiles * 4}},
+            {'binding': 3, 'resource': {'buffer': accum, 'offset': 0, 'size': accum.size}},
+            {'binding': 4, 'resource': {'buffer': uni_b, 'offset': 0, 'size': uni_b.size}},
+        ])
+        enc = self._device.create_command_encoder()
+        cp = enc.begin_compute_pass()
+        cp.set_pipeline(self._gv4_scatter_pipeline)
+        cp.set_bind_group(0, bg_b)
+        cp.dispatch_workgroups((max_count + 63) // 64, n_tiles)
+        cp.end()
+        self._device.queue.submit([enc.finish()])
+
+        return self._grain_resolve(frame, accum, prep, cw)
 
     def ca_frame(self, frame: "Frame", scale: float, samples: int = 16):
         """Spectral chromatic aberration, texture-resident: Frame in -> Frame out.

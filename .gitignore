@@ -29,3 +29,6 @@ output/
 !.vscode/launch.json
 !.vscode/extensions.json
 .idea/
+
+# Claude Code local machine settings (permission allowlists, absolute paths)
+.claude/
